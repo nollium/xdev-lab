@@ -590,18 +590,25 @@ AUEOF
     log "Waiting for OS install + first boot..."
 
     # ── wait for network ──
-    local t=0
+    local t=0 dhcp_tried=false
     while (( t < 2400 )); do
         if ping -c1 -W2 "$ip" &>/dev/null; then
             break
         fi
-        # check DHCP fallback
-        local dhcp_ip=$(ip neigh show dev "$BRIDGE" 2>/dev/null \
-            | grep "$mac" | grep -v FAILED | grep -v INCOMPLETE | awk '{print $1}' | head -1)
-        if [[ -n "$dhcp_ip" && "$dhcp_ip" != "$ip" ]]; then
-            log "Found at DHCP $dhcp_ip — setting static IP $ip..."
-            vm_exec "$dhcp_ip" "powershell -Command \"Set-NetFirewallProfile -All -Enabled False; \$a=(Get-NetAdapter|Select -First 1).Name; New-NetIPAddress -InterfaceAlias \$a -IPAddress $ip -PrefixLength 24 -DefaultGateway $HOST_IP -EA SilentlyContinue\"" &>/dev/null || true
-            sleep 10
+        # DHCP fallback: detect VM on a different IP via MAC, try to set static IP ONCE
+        if ! $dhcp_tried; then
+            local dhcp_ip=$(ip neigh show dev "$BRIDGE" 2>/dev/null \
+                | grep "$mac" | grep -v FAILED | grep -v INCOMPLETE | awk '{print $1}' | head -1)
+            if [[ -n "$dhcp_ip" && "$dhcp_ip" != "$ip" ]]; then
+                log "Detected at DHCP $dhcp_ip — attempting to set static IP $ip..."
+                if vm_exec "$dhcp_ip" "powershell -Command \"Set-NetFirewallProfile -All -Enabled False; \$a=(Get-NetAdapter|Select -First 1).Name; New-NetIPAddress -InterfaceAlias \$a -IPAddress $ip -PrefixLength 24 -DefaultGateway $HOST_IP -EA SilentlyContinue\"" &>/dev/null; then
+                    ok "Static IP set via DHCP fallback"
+                    sleep 10
+                else
+                    log "Could not reach VM at $dhcp_ip yet (firewall?) — waiting for FirstLogonCommands to set IP..."
+                fi
+                dhcp_tried=true
+            fi
         fi
         sleep 15; t=$((t+15))
         (( t % 120 == 0 )) && log "Still installing... (${t}s)"

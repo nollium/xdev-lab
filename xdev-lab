@@ -186,7 +186,7 @@ detect_iso_config() {
     local mnt
     mnt=$(mktemp -d) || return 0
 
-    sudo mount -o loop,ro "$iso" "$mnt" 2>/dev/null || { rmdir "$mnt" 2>/dev/null; return 0; }
+    timeout 30 sudo mount -o loop,ro "$iso" "$mnt" 2>/dev/null || { rmdir "$mnt" 2>/dev/null; warn "Could not mount ISO for config detection — using defaults"; return 0; }
 
     local wim="$mnt/sources/install.wim"
     if [[ ! -f "$wim" ]]; then
@@ -549,15 +549,24 @@ AUEOF
     # ── launch QEMU ──
     tap_ensure "$tap"
     rm -f "$qmp_sock"
-    qemu-system-x86_64 \
+    local qemu_out
+    qemu_out=$(qemu-system-x86_64 \
         -name "$name" -machine pc,accel=kvm -cpu host -smp "$cpus" -m "$ram" \
-        -hda "$dimg" -cdrom "$iso" -fda "$floppy" -boot d \
+        -hda "$dimg" -cdrom "$iso" -drive file="$floppy",format=raw,if=floppy -boot d \
         -device e1000e,netdev=n0,mac="$mac" \
         -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
         -vga std -display none -vnc "127.0.0.1:${vnc_num}" \
         -usb -device usb-tablet \
         -qmp "unix:${qmp_sock},server,nowait" \
-        -daemonize 2>&1
+        -daemonize 2>&1) || true
+
+    # Verify QEMU actually started
+    sleep 1
+    if ! vm_running "$name"; then
+        err "QEMU failed to start:"
+        echo "$qemu_out" >&2
+        die "Check: is the ISO path correct? Is KVM available? Is the TAP free?"
+    fi
 
     _db_set "$name" ip "$ip"
     _db_set "$name" build "${build:-unknown}"

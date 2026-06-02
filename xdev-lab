@@ -161,11 +161,86 @@ net_ensure() {
 
 tap_ensure() {
     local tap="$1"
+    # Kill any QEMU still holding this TAP
+    if ip link show "$tap" &>/dev/null; then
+        local holder=$(ip link show "$tap" 2>/dev/null | grep -oP 'master \K\S+')
+        # If the tap exists but is DOWN/no-carrier, delete and recreate
+        if ip link show "$tap" 2>/dev/null | grep -q "NO-CARRIER\|state DOWN"; then
+            sudo ip link del "$tap" 2>/dev/null || true
+        fi
+    fi
     if ! ip link show "$tap" &>/dev/null; then
         sudo ip tuntap add dev "$tap" mode tap user "$(whoami)"
     fi
-    sudo ip link set "$tap" up
+    sudo ip link set "$tap" up 2>/dev/null || true
     sudo brctl addif "$BRIDGE" "$tap" 2>/dev/null || true
+}
+
+# Detect the best WIM image index and product key strategy from an ISO
+# Sets: _IMG_INDEX, _PRODUCT_KEY_XML
+detect_iso_config() {
+    local iso="$1" build="${2:-}"
+    local mnt=$(mktemp -d)
+    _IMG_INDEX=1
+    _PRODUCT_KEY_XML=""
+
+    if ! sudo mount -o loop,ro "$iso" "$mnt" 2>/dev/null; then
+        rmdir "$mnt"; return
+    fi
+
+    local wim="$mnt/sources/install.wim"
+    if [[ ! -f "$wim" ]]; then
+        sudo umount "$mnt" 2>/dev/null; rmdir "$mnt"; return
+    fi
+
+    # Parse all image names and pick the best one
+    # Priority: Pro (not N) > Standard (Desktop/Eval) > Professional > any non-Core non-Home
+    local best_idx=1
+    best_idx=$(wiminfo "$wim" 2>/dev/null | awk '
+        /^Index:/ { idx = $2 }
+        /^Name:/ {
+            name = substr($0, index($0, ":")+2)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            # Skip N editions (no media player)
+            if (name ~ / N$/) next
+            # Exact match priorities (first match wins)
+            if (!found) {
+                n = toupper(name)
+                if (name ~ /Pro$/ || name == "Windows 10 Pro") { print idx; found=1; exit }
+                if (name ~ /Professional$/) { print idx; found=1; exit }
+                if (n ~ /SERVERSTANDARD$/ && n !~ /CORE/) { print idx; found=1; exit }
+                if (n ~ /STANDARD.*DESKTOP/) { print idx; found=1; exit }
+                if (n ~ /STANDARD.*EVALUATION/ && n !~ /CORE/) { best=idx }
+                if (n ~ /STANDARD/ && n !~ /CORE/) { if (!best) best=idx }
+            }
+        }
+        END { if (!found) print (best ? best : 1) }
+    ')
+    _IMG_INDEX="$best_idx"
+
+    # Check if this is an evaluation ISO (has embedded key) or needs a KMS key
+    local img_name=$(wiminfo "$wim" 2>/dev/null | awk -v idx="$best_idx" '
+        /^Index:/ { cur = $2 }
+        /^Name:/ { if (cur == idx) { print substr($0, index($0, ":")+2); exit } }
+    ')
+
+    # Eval ISOs: if the image name contains "Evaluation", skip ProductKey entirely
+    # Retail ISOs from MS: need the KMS generic key
+    # UUP ISOs: need the KMS generic key
+    if echo "$img_name" | grep -qi "evaluation"; then
+        # Eval ISO — omit ProductKey section entirely to let the embedded key work
+        _PRODUCT_KEY_XML=""
+    else
+        local kms=$(build_kms_key "${build:-0}")
+        if [[ -n "$kms" ]]; then
+            _PRODUCT_KEY_XML="<Key>$kms</Key>"
+        fi
+    fi
+
+    sudo umount "$mnt" 2>/dev/null
+    rmdir "$mnt" 2>/dev/null || true
+
+    log "  ISO config: index=$_IMG_INDEX ($img_name) key=$([ -n "$_PRODUCT_KEY_XML" ] && echo 'KMS' || echo 'eval/embedded')"
 }
 
 next_ip() {
@@ -331,7 +406,9 @@ for b,(d2,tt) in sorted(near.items(),key=lambda x:x[1][0])[:8]:
     ok "Packages: $(ls "$w/UUPs/" | wc -l) files, $(du -sh "$w/UUPs/" | cut -f1)"
 
     # ── 5. convert to ISO ──
-    log "Converting to ISO..."
+    log "Converting to ISO (this takes 10-20 minutes)..."
+    # Clean any leftover ISODIR from a previous failed run (prevents corrupt WIM)
+    rm -rf "$w/ISODIR" 2>/dev/null
     # chntpw stub (converter checks for it but we don't need it for server)
     mkdir -p "$HOME/bin"
     [[ -f "$HOME/bin/chntpw" ]] || { printf '#!/bin/bash\nexit 0\n' > "$HOME/bin/chntpw"; chmod +x "$HOME/bin/chntpw"; }
@@ -387,17 +464,27 @@ cmd_vm() {
     local qmp_sock="$(vm_qmp "$name")"
     local dimg="$(vm_disk "$name")"
 
+    # Kill any existing VM with this name
+    if vm_running "$name"; then
+        warn "VM '$name' already running — stopping it first"
+        kill "$(vm_pid "$name")" 2>/dev/null
+        sleep 2
+    fi
+    # Clean stale TAP
+    sudo ip link del "$tap" 2>/dev/null || true
+
     log "Creating VM '$name' from $iso"
     log "  IP=$ip  VNC=127.0.0.1:$((5900+vnc_num))  MAC=$mac"
     mkdir -p "$LAB/images"
 
     # ── disk ──
-    [[ -f "$dimg" ]] || qemu-img create -f qcow2 "$dimg" "${disk}G" >/dev/null
+    [[ -f "$dimg" ]] && { warn "Disk exists — removing for fresh install"; rm -f "$dimg"; }
+    qemu-img create -f qcow2 "$dimg" "${disk}G" >/dev/null
 
-    # ── autounattend ──
-    local kms_key=$(build_kms_key "${build:-0}")
-    local key_xml=""
-    [[ -n "$kms_key" ]] && key_xml="<Key>$kms_key</Key>"
+    # ── detect ISO config (image index + product key) ──
+    detect_iso_config "$iso" "${build:-0}"
+    local img_index="$_IMG_INDEX"
+    local key_xml="$_PRODUCT_KEY_XML"
 
     local au_xml="$LAB/images/${name}_autounattend.xml"
     cat > "$au_xml" << AUEOF
@@ -414,7 +501,7 @@ cmd_vm() {
         <ModifyPartitions><ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter><Active>true</Active></ModifyPartition></ModifyPartitions>
       </Disk></DiskConfiguration>
       <ImageInstall><OSImage><InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
-        <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData></InstallFrom>
+        <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>${img_index}</Value></MetaData></InstallFrom>
       </OSImage></ImageInstall>
       <UserData><AcceptEula>true</AcceptEula><ProductKey><WillShowUI>OnError</WillShowUI>${key_xml}</ProductKey></UserData>
     </component>
@@ -726,27 +813,14 @@ cmd_snapshot() {
 
 cmd_start() {
     local name="" debug="" extra="" cpus=""
-    # parse: xdev-lab start <name> [--debug gdb|serial|both] [--qemu-extra "..."] [--cpus N]
-    for arg in "$@"; do
-        case "$arg" in
-            --debug) shift; debug="${1:-gdb}"; shift || true; continue;;
-            --qemu-extra) shift; extra="$1"; shift || true; continue;;
-            --cpus) shift; cpus="$1"; shift || true; continue;;
-        esac
-        [[ -z "$name" ]] && name="$arg"
-    done
-    # simpler re-parse since the above loop is fragile with positional+flag mixing
-    name=""
-    debug=""
-    extra=""
-    cpus=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --debug) debug="${2:-gdb}"; shift 2;;
+            --debug)      debug="${2:-gdb}"; shift 2;;
             --qemu-extra) extra="$2"; shift 2;;
-            --cpus) cpus="$2"; shift 2;;
-            --break) extra="${extra} -S"; shift;;
-            *) name="${name:-$1}"; shift;;
+            --cpus)       cpus="$2"; shift 2;;
+            --break)      extra="${extra} -S"; shift;;
+            -*)           die "start: unknown flag $1";;
+            *)            name="${name:-$1}"; shift;;
         esac
     done
     [[ -z "$name" ]] && die "Usage: xdev-lab start <name> [--debug gdb|serial|both] [--cpus N] [--qemu-extra '...']"
@@ -934,22 +1008,12 @@ cmd_feature() {
 
     if $do_list; then
         log "Querying features on $name ($ip)..."
-        vm_exec "$ip" 'powershell -Command "
-$fw = (Get-NetFirewallProfile | Select -First 1).Enabled
-$rdp = (Get-ItemProperty \"HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\").fDenyTSConnections -eq 0
-$dbg = (bcdedit /enum {current} | Select-String \"debug.*Yes\") -ne $null
-$np = bcdedit /enum {current} | Select-String \"numproc\"
-$ts = (bcdedit /enum {current} | Select-String \"testsigning.*Yes\") -ne $null
-$smb = (Get-SmbServerConfiguration).EnableSMB2Protocol
-$comp = try { (Get-ItemProperty \"HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\" -EA Stop).DisableCompression -eq 0 } catch { \"default(enabled)\" }
-Write-Host \"Firewall:           $(if($fw){\"ON\"}else{\"OFF\"})\"
-Write-Host \"RDP:                $(if($rdp){\"ON\"}else{\"OFF\"})\"
-Write-Host \"KernelDebug:        $(if($dbg){\"ON\"}else{\"OFF\"})\"
-Write-Host \"NumProc:            $np\"
-Write-Host \"TestSigning:        $(if($ts){\"ON\"}else{\"OFF\"})\"
-Write-Host \"SMB2:               $(if($smb){\"ON\"}else{\"OFF\"})\"
-Write-Host \"SMBv3Compression:   $comp\"
-"' 2>/dev/null
+        # Run simple commands separately to avoid wmiexec timeout on complex PS
+        echo "  Firewall:        $(vm_exec "$ip" 'powershell -Command "(Get-NetFirewallProfile|Select -First 1).Enabled"' 2>/dev/null | tail -1)"
+        echo "  RDP:             $(vm_exec "$ip" 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections 2>nul' 2>/dev/null | grep -oP '0x\d')"
+        echo "  KernelDebug:     $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr debug' 2>/dev/null | tail -1)"
+        echo "  NumProc:         $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr numproc' 2>/dev/null | tail -1)"
+        echo "  TestSigning:     $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr testsigning' 2>/dev/null | tail -1)"
         return 0
     fi
 

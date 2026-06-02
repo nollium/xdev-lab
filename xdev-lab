@@ -804,16 +804,23 @@ cmd_update() {
         fi
     fi
 
-    log "Installing $kb on $name..."
+    log "Installing $kb on $name (extract CAB + DISM)..."
     vm_exec "$ip" "powershell -Command \"
         \$msu = Get-ChildItem C:\\Windows\\Temp\\*.msu | Select -First 1
-        if (\$msu) {
-            Write-Host ('Installing ' + \$msu.Name + '...')
-            wusa.exe \$msu.FullName /quiet /norestart
-            Write-Host 'Done — reboot required'
+        if (-not \$msu) { Write-Host 'No MSU found'; exit 1 }
+        Write-Host ('Extracting ' + \$msu.Name + '...')
+        New-Item C:\\Windows\\Temp\\kb_ext -ItemType Directory -Force | Out-Null
+        & expand.exe \$msu.FullName -F:* C:\\Windows\\Temp\\kb_ext\\
+        \$cab = Get-ChildItem C:\\Windows\\Temp\\kb_ext\\*.cab | Where-Object { \$_.Name -ne 'WSUSSCAN.cab' } | Select -First 1
+        if (\$cab) {
+            Write-Host ('Installing via DISM: ' + \$cab.Name)
+            dism /online /add-package /PackagePath:(\$cab.FullName) /quiet /norestart
+            Write-Host ('DISM exit: ' + \$LASTEXITCODE)
         } else {
-            Write-Host 'No MSU found in C:\\Windows\\Temp\\'
+            Write-Host 'Falling back to wusa...'
+            wusa.exe \$msu.FullName /quiet /norestart
         }
+        Write-Host 'Done — reboot required'
     \"" 2>/dev/null
 
     ok "Update applied. Reboot with: xdev-lab stop $name && xdev-lab start $name"

@@ -212,7 +212,9 @@ detect_iso_config() {
             }
         }
         END { if (!found) print (best ? best : 1) }
-    ' || echo 1)
+    ') || true
+    best_idx="${best_idx%%$'\n'*}"  # strip newlines
+    best_idx="${best_idx//[^0-9]/}"  # keep only digits
     _IMG_INDEX="${best_idx:-1}"
 
     # Get the image name for logging and eval detection
@@ -224,12 +226,18 @@ detect_iso_config() {
     img_name="${img_name%%$'\n'*}"  # strip any trailing newline
     img_name="${img_name%%$'\r'*}"  # strip any trailing CR
 
-    # Eval ISOs skip ProductKey; UUP/retail need KMS key
-    if echo "$img_name" | grep -qi "evaluation"; then
-        _PRODUCT_KEY_XML=""
-    else
-        local kms
-        kms=$(build_kms_key "${build:-0}") || true
+    # Product key strategy:
+    # - Multi-edition ISOs ALWAYS need a key for unattended edition selection
+    # - Eval ISOs: the KMS key works for selection, activation uses embedded eval key
+    # - UUP ISOs: KMS key for both selection and activation
+    # - Single-edition ISOs: no key needed
+    local edition_count
+    edition_count=$(wiminfo "$wim" 2>/dev/null | grep -c "^Index:" || echo 1)
+
+    local kms
+    kms=$(build_kms_key "${build:-0}") || true
+    if [[ "$edition_count" -gt 1 ]] || [[ -n "$kms" ]]; then
+        # Multi-edition or KMS-capable: always provide the key
         [[ -n "$kms" ]] && _PRODUCT_KEY_XML="<Key>$kms</Key>"
     fi
 
@@ -499,7 +507,7 @@ cmd_vm() {
       <ImageInstall><OSImage><InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
         <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>${img_index}</Value></MetaData></InstallFrom>
       </OSImage></ImageInstall>
-      <UserData><AcceptEula>true</AcceptEula><ProductKey><WillShowUI>OnError</WillShowUI>${key_xml}</ProductKey></UserData>
+      <UserData><AcceptEula>true</AcceptEula><ProductKey><WillShowUI>Never</WillShowUI>${key_xml}</ProductKey></UserData>
     </component>
   </settings>
   <settings pass="specialize">

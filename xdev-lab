@@ -236,30 +236,34 @@ cmd_iso() {
     # ── 1. find UUID on UUP dump ──
     log "Querying UUP dump API..."
     local uuid
-    uuid=$(python3 << 'PYEOF'
-import urllib.request, json, sys
-build = sys.argv[1] if len(sys.argv)>1 else ""
+    uuid=$(UUP_BUILD="$build" UUP_FAM="$fam" python3 << 'PYEOF'
+import urllib.request, json, os
+build = os.environ.get("UUP_BUILD","")
 major = build.split(".")[0]
+fam = os.environ.get("UUP_FAM","")
 req = urllib.request.Request(
     f"https://api.uupdump.net/listid.php?search={major}",
     headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"})
 try:
     data = json.loads(urllib.request.urlopen(req,timeout=20).read())
 except Exception as e:
-    print(f"API_ERROR",file=sys.stderr); sys.exit(1)
+    print("API_ERROR"); exit(1)
 builds = data.get("response",{}).get("builds",{})
-fam = sys.argv[2] if len(sys.argv)>2 else ""
 cands = []
 for k,info in builds.items():
     b,t = info.get("build",""), info.get("title","").lower()
     if b != build: continue
     if any(w in t for w in ["insider","preview","canary","beta"]): continue
-    sc = 10 if ("server" in fam and any(w in t for w in ["server","microsoft server"])) else 0
+    sc = 0
+    if "server" in fam and any(w in t for w in ["server","microsoft server"]): sc += 10
+    if "win10" in fam and "windows 10" in t: sc += 10
+    if "win11" in fam and "windows 11" in t: sc += 10
+    if "feature update" not in t: sc += 5  # prefer CU over feature update
     cands.append((sc, info["uuid"], t))
 cands.sort(key=lambda x:-x[0])
 print(cands[0][1] if cands else "NOT_FOUND")
 PYEOF
-    "$build" "$fam" 2>/dev/null) || uuid="NOT_FOUND"
+    ) || uuid="NOT_FOUND"
 
     if [[ "$uuid" == "NOT_FOUND" || -z "$uuid" ]]; then
         warn "Build $build not on UUP dump. Nearby builds:"
@@ -298,7 +302,17 @@ for b,(d2,tt) in sorted(near.items(),key=lambda x:x[1][0])[:8]:
         mkdir -p "$w/files"
         curl -sfL "https://git.uupdump.net/uup-dump/converter/raw/branch/main/convert.sh" \
             -o "$w/files/convert.sh" 2>/dev/null || true
-        [[ -s "$w/files/convert.sh" ]] || die "Cannot fetch converter — git.uupdump.net may be down"
+        if [[ ! -s "$w/files/convert.sh" ]]; then
+            # fallback: copy from any existing build's converter
+            local cached=$(find "$LAB/work" -path "*/files/convert.sh" -size +1k 2>/dev/null | head -1)
+            if [[ -n "$cached" ]]; then
+                cp "$cached" "$w/files/convert.sh"
+                cp "$(dirname "$cached")/convert_ve_plugin" "$w/files/" 2>/dev/null || true
+                log "Using cached converter from $cached"
+            else
+                die "Cannot fetch converter and no cached copy found"
+            fi
+        fi
         chmod +x "$w/files/convert.sh"
     fi
 

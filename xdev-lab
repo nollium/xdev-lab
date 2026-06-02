@@ -71,9 +71,20 @@ json.dump(db,open(p,'w'),indent=2)
 
 vm_ip()  { _db_get "$1" ip; }
 vm_qmp() { echo "/tmp/qemu-${1}-qmp.sock"; }
-vm_pid() { pgrep -f "qemu.*-name $1" 2>/dev/null | head -1; }
+vm_pid() { pgrep -f "qemu.*-name $1 " 2>/dev/null | head -1; }
 vm_running() { [ -n "$(vm_pid "$1")" ]; }
 vm_disk() { echo "$LAB/images/${1}.qcow2"; }
+
+# Require VM to exist in DB and be running. Die with clear message if not.
+require_vm() {
+    local name="$1"
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "VM '$name' not found. Run: xdev-lab list"
+    if ! vm_running "$name"; then
+        die "VM '$name' is not running. Start it with: xdev-lab start $name"
+    fi
+    echo "$ip"
+}
 
 # ── smb helpers via impacket ─────────────────────────────────────────────
 
@@ -627,8 +638,7 @@ cmd_tools() {
         esac
     done
     [[ -z "$name" ]] && die "tools: --vm <name> required"
-    local ip=$(vm_ip "$name")
-    [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
 
     log "Installing tools ($profile) on $name ($ip)..."
 
@@ -710,8 +720,7 @@ cmd_ad() {
         esac
     done
     [[ -z "$name" ]] && die "ad: --vm <name> required"
-    local ip=$(vm_ip "$name")
-    [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
     [[ -z "$netbios" ]] && netbios=$(echo "$domain" | cut -d. -f1 | tr '[:lower:]' '[:upper:]')
 
     log "Setting up AD DS on $name ($ip)"
@@ -763,8 +772,7 @@ cmd_update() {
     done
     [[ -z "$name" ]] && die "update: --vm <name> required"
     [[ -z "$kb" && -z "$msu" ]] && die "update: --kb <KB number> or --msu <path> required"
-    local ip=$(vm_ip "$name")
-    [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
 
     if [[ -n "$msu" && -f "$msu" ]]; then
         log "Uploading $msu to VM..."
@@ -928,13 +936,13 @@ for n,i in sorted(db.items()):
 
 cmd_exec() {
     local name="${1:?Usage: xdev-lab exec <name> <cmd>}"; shift
-    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
     vm_exec "$ip" "$*"
 }
 
 cmd_extract() {
     local name="${1:?}" remote="${2:?}" dst="${3:?}"
-    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
     vm_download "$ip" "$remote" "$dst"
     ok "$remote -> $dst"
 }
@@ -986,7 +994,7 @@ cmd_debug() {
             --mode|-m) mode="$2"; shift 2;;
             --enable) # enable kernel debug on a running VM (bcdedit)
                 name="$2"; shift 2
-                local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+                local ip; ip=$(require_vm "$name")
                 log "Enabling kernel debug on $name..."
                 vm_exec "$ip" 'powershell -Command "bcdedit /debug on; bcdedit /dbgsettings serial debugport:1 baudrate:115200; bcdedit /set numproc 1"' 2>/dev/null
                 ok "Kernel debug enabled. Reboot required: xdev-lab stop $name && xdev-lab start $name --debug serial"
@@ -1017,7 +1025,7 @@ cmd_feature() {
         esac
     done
     [[ -z "$name" ]] && die "Usage: xdev-lab feature --vm <name> --enable|--disable <feature> | --list"
-    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
 
     if $do_list; then
         log "Querying features on $name ($ip)..."
@@ -1102,7 +1110,7 @@ cmd_offsets() {
         esac
     done
     [[ -z "$name" ]] && die "Usage: xdev-lab offsets --vm <name> --exploit smbghost [--method vm|linux] [--out file]"
-    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
 
     case "${exploit,,}" in
         smbghost|smbleed|smbleedingghost|cve-2020-0796)
@@ -1220,7 +1228,7 @@ cmd_exploit_test() {
     done
     [[ -z "$name" || -z "$poc" ]] && die "Usage: xdev-lab exploit-test --vm <name> --poc <script> [--args '...'] [--expect crash|shell|timeout] [--timeout N] [--listen port]"
     [[ -f "$poc" ]] || die "PoC not found: $poc"
-    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    local ip; ip=$(require_vm "$name")
 
     local ts=$(date +%Y%m%d_%H%M%S)
     local results_dir="$LAB/results/${name}_${ts}"

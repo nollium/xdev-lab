@@ -781,10 +781,27 @@ cmd_update() {
     [[ -z "$kb" && -z "$msu" ]] && die "update: --kb <KB number> or --msu <path> required"
     local ip; ip=$(require_vm "$name")
 
-    if [[ -n "$msu" && -f "$msu" ]]; then
-        log "Uploading $msu to VM..."
-        vm_upload "$ip" "$msu" "Windows/Temp/$(basename "$msu")"
-        kb=$(basename "$msu" .msu)
+    if [[ -n "$msu" ]]; then
+        if [[ "$msu" == http://* || "$msu" == https://* ]]; then
+            # Download URL — serve via HTTP and install on VM
+            local url="$msu"
+            local fname=$(basename "$url" | sed 's/\?.*//')
+            log "Downloading $fname from URL..."
+            wget -q -O "/tmp/$fname" "$url" || die "Download failed"
+            msu="/tmp/$fname"
+        fi
+        if [[ -f "$msu" ]]; then
+            local fname=$(basename "$msu")
+            log "Serving $fname to VM via HTTP..."
+            cd "$(dirname "$msu")" && python3 -m http.server 8888 --bind "$HOST_IP" &>/dev/null &
+            local http_pid=$!
+            sleep 1
+            vm_exec "$ip" "powershell -Command \"Invoke-WebRequest -Uri http://${HOST_IP}:8888/$fname -OutFile C:\\Windows\\Temp\\$fname -UseBasicParsing\"" 2>/dev/null
+            kill $http_pid 2>/dev/null
+            kb="${fname%.msu}"
+        else
+            die "MSU not found: $msu"
+        fi
     fi
 
     log "Installing $kb on $name..."

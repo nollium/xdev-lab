@@ -180,30 +180,27 @@ tap_ensure() {
 # Sets: _IMG_INDEX, _PRODUCT_KEY_XML
 detect_iso_config() {
     local iso="$1" build="${2:-}"
-    local mnt=$(mktemp -d)
     _IMG_INDEX=1
     _PRODUCT_KEY_XML=""
 
-    if ! sudo mount -o loop,ro "$iso" "$mnt" 2>/dev/null; then
-        rmdir "$mnt"; return
-    fi
+    local mnt
+    mnt=$(mktemp -d) || return 0
+
+    sudo mount -o loop,ro "$iso" "$mnt" 2>/dev/null || { rmdir "$mnt" 2>/dev/null; return 0; }
 
     local wim="$mnt/sources/install.wim"
     if [[ ! -f "$wim" ]]; then
-        sudo umount "$mnt" 2>/dev/null; rmdir "$mnt"; return
+        sudo umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null; return 0
     fi
 
-    # Parse all image names and pick the best one
-    # Priority: Pro (not N) > Standard (Desktop/Eval) > Professional > any non-Core non-Home
-    local best_idx=1
+    # Parse all image names and pick the best one (pipefail-safe)
+    local best_idx
     best_idx=$(wiminfo "$wim" 2>/dev/null | awk '
         /^Index:/ { idx = $2 }
         /^Name:/ {
             name = substr($0, index($0, ":")+2)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-            # Skip N editions (no media player)
             if (name ~ / N$/) next
-            # Exact match priorities (first match wins)
             if (!found) {
                 n = toupper(name)
                 if (name ~ /Pro$/ || name == "Windows 10 Pro") { print idx; found=1; exit }
@@ -215,29 +212,28 @@ detect_iso_config() {
             }
         }
         END { if (!found) print (best ? best : 1) }
-    ')
-    _IMG_INDEX="$best_idx"
+    ' || echo 1)
+    _IMG_INDEX="${best_idx:-1}"
 
-    # Check if this is an evaluation ISO (has embedded key) or needs a KMS key
-    local img_name=$(wiminfo "$wim" 2>/dev/null | awk -v idx="$best_idx" '
+    # Get the image name for logging and eval detection
+    local img_name
+    img_name=$(wiminfo "$wim" 2>/dev/null | awk -v idx="$_IMG_INDEX" '
         /^Index:/ { cur = $2 }
-        /^Name:/ { if (cur == idx) { print substr($0, index($0, ":")+2); exit } }
-    ')
+        /^Name:/ { if (cur == idx) { sub(/^.*Name:[[:space:]]*/, ""); gsub(/\r/,""); print; exit } }
+    ' || echo "unknown")
+    img_name="${img_name%%$'\n'*}"  # strip any trailing newline
+    img_name="${img_name%%$'\r'*}"  # strip any trailing CR
 
-    # Eval ISOs: if the image name contains "Evaluation", skip ProductKey entirely
-    # Retail ISOs from MS: need the KMS generic key
-    # UUP ISOs: need the KMS generic key
+    # Eval ISOs skip ProductKey; UUP/retail need KMS key
     if echo "$img_name" | grep -qi "evaluation"; then
-        # Eval ISO — omit ProductKey section entirely to let the embedded key work
         _PRODUCT_KEY_XML=""
     else
-        local kms=$(build_kms_key "${build:-0}")
-        if [[ -n "$kms" ]]; then
-            _PRODUCT_KEY_XML="<Key>$kms</Key>"
-        fi
+        local kms
+        kms=$(build_kms_key "${build:-0}") || true
+        [[ -n "$kms" ]] && _PRODUCT_KEY_XML="<Key>$kms</Key>"
     fi
 
-    sudo umount "$mnt" 2>/dev/null
+    sudo umount "$mnt" 2>/dev/null || true
     rmdir "$mnt" 2>/dev/null || true
 
     log "  ISO config: index=$_IMG_INDEX ($img_name) key=$([ -n "$_PRODUCT_KEY_XML" ] && echo 'KMS' || echo 'eval/embedded')"

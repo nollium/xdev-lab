@@ -1,0 +1,28 @@
+# Disk images and VM artifacts
+images/
+iso/
+work/
+vms.json
+
+# Extracted binaries
+*.dll
+*.exe
+*.sys
+*.pdb
+
+# QEMU artifacts
+*.qcow2
+*.img
+*.fd
+
+# Captures
+captures/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+exploits/

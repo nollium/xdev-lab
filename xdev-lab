@@ -1,0 +1,895 @@
+#!/bin/bash
+#
+# xdev-lab — Windows exploit development lab on QEMU/KVM
+#
+# Targets exact Windows builds. One command from build number to running VM
+# with full exploit dev toolchain.
+#
+# Usage:
+#   xdev-lab create --build 26100.32690 --name ws2025-vuln [--ad corp.local]
+#   xdev-lab iso    --build 26100.32690
+#   xdev-lab vm     --name test --iso /path/to/iso [--ip 10.10.10.30]
+#   xdev-lab tools  --vm test [--profile exploit-dev]
+#   xdev-lab ad     --vm test --domain corp.local
+#   xdev-lab update --vm test --kb KB5082063
+#   xdev-lab list
+#   xdev-lab start|stop|destroy <name>
+#   xdev-lab exec   <name> <command>
+#   xdev-lab extract <name> <remote-path> <local-path>
+#   xdev-lab snapshot <name> create|restore|list [snap-name]
+#   xdev-lab screenshot <name> [output.png]
+#
+set -euo pipefail
+
+LAB="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DB="$LAB/vms.json"
+
+BRIDGE="br-lab"
+SUBNET="10.10.10"
+HOST_IP="${SUBNET}.1"
+PASSWORD='Lab@dmin1!'
+LM="aad3b435b51404eeaad3b435b51404ee"
+NT="c07bbd6d874b375f83efdb1dd809433e"
+
+# ── logging ──────────────────────────────────────────────────────────────
+
+log()  { printf '[*] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
+
+# ── vm database (json, via python oneliners) ─────────────────────────────
+
+_db_get() {
+    python3 -c "
+import json,os,sys
+db=json.load(open('$DB')) if os.path.exists('$DB') else {}
+v=db.get('$1',{}).get('$2','')
+if v: print(v)
+" 2>/dev/null
+}
+
+_db_set() {
+    python3 -c "
+import json,os
+p='$DB'
+db=json.load(open(p)) if os.path.exists(p) else {}
+db.setdefault('$1',{})['$2']='$3'
+json.dump(db,open(p,'w'),indent=2)
+" 2>/dev/null
+}
+
+_db_del() {
+    python3 -c "
+import json,os
+p='$DB'
+db=json.load(open(p)) if os.path.exists(p) else {}
+db.pop('$1',None)
+json.dump(db,open(p,'w'),indent=2)
+" 2>/dev/null
+}
+
+vm_ip()  { _db_get "$1" ip; }
+vm_qmp() { echo "/tmp/qemu-${1}-qmp.sock"; }
+vm_pid() { pgrep -f "qemu.*-name $1" 2>/dev/null | head -1; }
+vm_running() { [ -n "$(vm_pid "$1")" ]; }
+vm_disk() { echo "$LAB/images/${1}.qcow2"; }
+
+# ── smb helpers via impacket ─────────────────────────────────────────────
+
+_smb() {
+    # $1=ip $2=python-body  (conn object available, authenticated)
+    python3 -c "
+from impacket.smbconnection import SMBConnection
+import sys
+conn=SMBConnection('$1','$1')
+conn.login('Administrator','','',lmhash='$LM',nthash='$NT')
+$2
+conn.close()
+" 2>/dev/null
+}
+
+vm_exec() {
+    local ip="$1"; shift
+    wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1 \
+        | grep -v "^Impacket\|^\[\*\] SMB"
+}
+
+vm_upload() {
+    local ip="$1" src="$2" dst="$3"
+    _smb "$ip" "
+with open('$src','rb') as f:
+    conn.putFile('C\$','$dst',f.read)
+print('ok')
+"
+}
+
+vm_download() {
+    local ip="$1" remote="$2" local_path="$3"
+    _smb "$ip" "
+with open('$local_path','wb') as f:
+    conn.getFile('C\$','$remote',f.write)
+print('ok')
+"
+}
+
+# ── qmp helper ───────────────────────────────────────────────────────────
+
+qmp() {
+    local sock="$(vm_qmp "$1")"
+    [ -S "$sock" ] || return 1
+    python3 -c "
+import socket,json,time,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect('$sock')
+s.settimeout(10)
+s.recv(4096)
+s.sendall(json.dumps({'execute':'qmp_capabilities'}).encode()+b'\n')
+time.sleep(0.3);s.recv(4096)
+cmd=$2
+s.sendall(json.dumps(cmd).encode()+b'\n')
+time.sleep(1)
+r=s.recv(4096).decode()
+s.close()
+print(r)
+" 2>/dev/null
+}
+
+# ── network ──────────────────────────────────────────────────────────────
+
+net_ensure() {
+    if ! ip link show "$BRIDGE" &>/dev/null; then
+        sudo ip link add "$BRIDGE" type bridge
+        sudo ip addr add "${HOST_IP}/24" dev "$BRIDGE"
+        sudo ip link set "$BRIDGE" up
+        ok "Bridge $BRIDGE created"
+    fi
+    sudo sysctl -qw net.ipv4.ip_forward=1
+    local s="${SUBNET}.0/24"
+    sudo iptables -C FORWARD -s "$s" -j ACCEPT 2>/dev/null \
+        || sudo iptables -I FORWARD 1 -s "$s" -j ACCEPT
+    sudo iptables -C FORWARD -d "$s" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || sudo iptables -I FORWARD 1 -d "$s" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    sudo iptables -t nat -C POSTROUTING -s "$s" ! -d "$s" -j MASQUERADE 2>/dev/null \
+        || sudo iptables -t nat -A POSTROUTING -s "$s" ! -d "$s" -j MASQUERADE
+    if ! pgrep -f "dnsmasq.*${BRIDGE}" &>/dev/null; then
+        sudo dnsmasq --interface="$BRIDGE" --bind-interfaces --except-interface=lo \
+            --dhcp-range="${SUBNET}.100,${SUBNET}.200,12h" \
+            --log-facility=/tmp/dnsmasq-lab.log --pid-file=/tmp/dnsmasq-lab.pid 2>/dev/null || true
+    fi
+}
+
+tap_ensure() {
+    local tap="$1"
+    if ! ip link show "$tap" &>/dev/null; then
+        sudo ip tuntap add dev "$tap" mode tap user "$(whoami)"
+    fi
+    sudo ip link set "$tap" up
+    sudo brctl addif "$BRIDGE" "$tap" 2>/dev/null || true
+}
+
+next_ip() {
+    python3 -c "
+import json,os
+db=json.load(open('$DB')) if os.path.exists('$DB') else {}
+used={int(v.get('ip','0.0.0.0').split('.')[-1]) for v in db.values() if v.get('ip')}
+for i in range(10,250):
+    if i not in used: print('${SUBNET}.'+str(i)); break
+" 2>/dev/null
+}
+
+# ── build mapping ────────────────────────────────────────────────────────
+
+build_family() {
+    case "${1%%.*}" in
+        26100) echo ws2025;; 25398) echo ws2025-23h2;; 20348) echo ws2022;;
+        17763) echo ws2019;; 14393) echo ws2016;; 22631) echo win11-23h2;;
+        22621) echo win11-22h2;; 22000) echo win11-21h2;; 1904[1-5]) echo win10;;
+        *) echo "win-${1%%.*}";;
+    esac
+}
+
+build_edition() {
+    case "$(build_family "$1")" in ws*) echo ServerStandard;; *) echo Professional;; esac
+}
+
+# KMS generic client keys (for non-eval ISOs)
+build_kms_key() {
+    case "${1%%.*}" in
+        26100) echo "TVRH6-WHNXV-R9WG3-9XRFY-MY832";;  # WS2025 Std
+        20348) echo "VDYBN-27WPP-V4HQT-9VMD4-VMK7H";;  # WS2022 Std
+        17763) echo "N69G4-B89J2-4G8F4-WWYCC-J464C";;  # WS2019 Std
+        14393) echo "WC2BQ-8NRM3-FDDYY-2BFGV-KHKQY";;  # WS2016 Std
+        22631|22621|22000) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";; # W11 Pro
+        1904[1-5]) echo "W269N-WFGWX-YVC9B-4J6C9-T83GX";;         # W10 Pro
+        *) echo "";;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: iso
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_iso() {
+    local build="" edition=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --build|-b) build="$2"; shift 2;;
+            --edition|-e) edition="$2"; shift 2;;
+            *) build="${build:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$build" ]] && die "Usage: xdev-lab iso --build <number>"
+    local fam=$(build_family "$build")
+    [[ -z "$edition" ]] && edition=$(build_edition "$build")
+    local out="$LAB/iso/${fam}_${build}_${edition}.iso"
+
+    [[ -f "$out" ]] && { ok "ISO exists: $out"; return 0; }
+
+    local w="$LAB/work/uup_${build}"
+    mkdir -p "$w" "$LAB/iso"
+
+    log "Building ISO for $build ($fam $edition)"
+
+    # ── 1. find UUID on UUP dump ──
+    log "Querying UUP dump API..."
+    local uuid
+    uuid=$(python3 << 'PYEOF'
+import urllib.request, json, sys
+build = sys.argv[1] if len(sys.argv)>1 else ""
+major = build.split(".")[0]
+req = urllib.request.Request(
+    f"https://api.uupdump.net/listid.php?search={major}",
+    headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)"})
+try:
+    data = json.loads(urllib.request.urlopen(req,timeout=20).read())
+except Exception as e:
+    print(f"API_ERROR",file=sys.stderr); sys.exit(1)
+builds = data.get("response",{}).get("builds",{})
+fam = sys.argv[2] if len(sys.argv)>2 else ""
+cands = []
+for k,info in builds.items():
+    b,t = info.get("build",""), info.get("title","").lower()
+    if b != build: continue
+    if any(w in t for w in ["insider","preview","canary","beta"]): continue
+    sc = 10 if ("server" in fam and any(w in t for w in ["server","microsoft server"])) else 0
+    cands.append((sc, info["uuid"], t))
+cands.sort(key=lambda x:-x[0])
+print(cands[0][1] if cands else "NOT_FOUND")
+PYEOF
+    "$build" "$fam" 2>/dev/null) || uuid="NOT_FOUND"
+
+    if [[ "$uuid" == "NOT_FOUND" || -z "$uuid" ]]; then
+        warn "Build $build not on UUP dump. Nearby builds:"
+        python3 -c "
+import urllib.request,json,sys
+req=urllib.request.Request('https://api.uupdump.net/listid.php?search=${build%%.*}',headers={'User-Agent':'Mozilla/5.0'})
+d=json.loads(urllib.request.urlopen(req,timeout=15).read())
+bs=d.get('response',{}).get('builds',{})
+t=int('$build'.split('.')[1]) if '.' in '$build' else 0
+near={}
+for k,i in bs.items():
+    b=i.get('build','')
+    if not b.startswith('${build%%.*}.'): continue
+    try:
+        m=int(b.split('.')[1]); d2=abs(m-t)
+        if d2<=500 and b not in near: near[b]=(d2,i['title'])
+    except: pass
+for b,(d2,tt) in sorted(near.items(),key=lambda x:x[1][0])[:8]:
+    print(f'  {b:20s} (+{d2:3d}) {tt}')
+" 2>&1
+        die "Use a nearby build or provide --iso manually"
+    fi
+    ok "UUID: $uuid"
+
+    # ── 2. download UUP package ──
+    if [[ ! -f "$w/uup_download_linux.sh" ]]; then
+        log "Fetching UUP download package..."
+        curl -sfL "https://uupdump.net/get.php?id=${uuid}&pack=en-us&edition=${edition}&autodl=2" \
+            -H "User-Agent: Mozilla/5.0" -o "$w/uup_download.zip" || die "Failed to fetch UUP package"
+        unzip -qo "$w/uup_download.zip" -d "$w/"
+    fi
+
+    # ── 3. get converter if missing ──
+    if [[ ! -s "$w/files/convert.sh" ]]; then
+        log "Fetching converter..."
+        mkdir -p "$w/files"
+        curl -sfL "https://git.uupdump.net/uup-dump/converter/raw/branch/main/convert.sh" \
+            -o "$w/files/convert.sh" 2>/dev/null || true
+        [[ -s "$w/files/convert.sh" ]] || die "Cannot fetch converter — git.uupdump.net may be down"
+        chmod +x "$w/files/convert.sh"
+    fi
+
+    # ── 4. download packages ──
+    if [[ ! -d "$w/UUPs" ]] || [[ $(ls "$w/UUPs/" 2>/dev/null | wc -l) -lt 10 ]]; then
+        log "Downloading package list..."
+        aria2c --no-conf --console-log-level=warn \
+            -o aria2_script.txt --dir="$w" \
+            --allow-overwrite=true --auto-file-renaming=false \
+            "https://uupdump.net/get.php?id=${uuid}&pack=en-us&edition=${edition}&aria2=2" 2>&1 | tail -2
+        mkdir -p "$w/UUPs"
+        log "Downloading Windows packages from Microsoft (this takes a while)..."
+        aria2c --no-conf --console-log-level=warn \
+            -x16 -s16 -j5 -c -R -d"$w/UUPs" -i"$w/aria2_script.txt" 2>&1 | tail -5
+    fi
+    ok "Packages: $(ls "$w/UUPs/" | wc -l) files, $(du -sh "$w/UUPs/" | cut -f1)"
+
+    # ── 5. convert to ISO ──
+    log "Converting to ISO..."
+    # chntpw stub (converter checks for it but we don't need it for server)
+    mkdir -p "$HOME/bin"
+    [[ -f "$HOME/bin/chntpw" ]] || { printf '#!/bin/bash\nexit 0\n' > "$HOME/bin/chntpw"; chmod +x "$HOME/bin/chntpw"; }
+    export PATH="$HOME/bin:$PATH"
+    ( cd "$w" && bash files/convert.sh wim UUPs 0 ) 2>&1 | tail -5
+
+    local produced
+    produced=$(find "$w" -maxdepth 1 \( -name "*.ISO" -o -name "*.iso" \) 2>/dev/null | head -1)
+    [[ -n "$produced" ]] || die "ISO conversion failed. Check $w/ for errors."
+    mv "$produced" "$out"
+    ok "ISO: $out ($(du -h "$out" | cut -f1))"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: vm
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_vm() {
+    local name="" iso="" build="" ram=4096 cpus=2 disk=60 ip=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name|-n) name="$2"; shift 2;;
+            --iso|-i)  iso="$2"; shift 2;;
+            --build|-b) build="$2"; shift 2;;
+            --ram)  ram="$2"; shift 2;;
+            --cpus) cpus="$2"; shift 2;;
+            --disk) disk="$2"; shift 2;;
+            --ip)   ip="$2"; shift 2;;
+            *) die "vm: unknown flag $1";;
+        esac
+    done
+
+    # resolve ISO from build if needed
+    if [[ -n "$build" && -z "$iso" ]]; then
+        local fam=$(build_family "$build")
+        iso=$(find "$LAB/iso" -name "${fam}_${build}_*.iso" 2>/dev/null | head -1)
+        if [[ -z "$iso" ]]; then
+            log "No ISO for $build — building..."
+            cmd_iso --build "$build"
+            iso=$(find "$LAB/iso" -name "${fam}_${build}_*.iso" 2>/dev/null | head -1)
+        fi
+    fi
+    [[ -z "$name" ]] && die "vm: --name required"
+    [[ -z "$iso" ]]  && die "vm: --iso or --build required"
+    [[ -f "$iso" ]]  || die "ISO not found: $iso"
+
+    net_ensure
+    [[ -z "$ip" ]] && ip=$(next_ip)
+    local last_octet="${ip##*.}"
+    local tap="tap-${name}"
+    local mac="52:54:00:dc:00:$(printf '%02x' "$last_octet")"
+    local vnc_num=$((last_octet - 8)); (( vnc_num < 1 )) && vnc_num=2
+    local qmp_sock="$(vm_qmp "$name")"
+    local dimg="$(vm_disk "$name")"
+
+    log "Creating VM '$name' from $iso"
+    log "  IP=$ip  VNC=127.0.0.1:$((5900+vnc_num))  MAC=$mac"
+    mkdir -p "$LAB/images"
+
+    # ── disk ──
+    [[ -f "$dimg" ]] || qemu-img create -f qcow2 "$dimg" "${disk}G" >/dev/null
+
+    # ── autounattend ──
+    local kms_key=$(build_kms_key "${build:-0}")
+    local key_xml=""
+    [[ -n "$kms_key" ]] && key_xml="<Key>$kms_key</Key>"
+
+    local au_xml="$LAB/images/${name}_autounattend.xml"
+    cat > "$au_xml" << AUEOF
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <DiskConfiguration><Disk wcm:action="add"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
+        <CreatePartitions><CreatePartition wcm:action="add"><Order>1</Order><Extend>true</Extend><Type>Primary</Type></CreatePartition></CreatePartitions>
+        <ModifyPartitions><ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter><Active>true</Active></ModifyPartition></ModifyPartitions>
+      </Disk></DiskConfiguration>
+      <ImageInstall><OSImage><InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
+        <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData></InstallFrom>
+      </OSImage></ImageInstall>
+      <UserData><AcceptEula>true</AcceptEula><ProductKey><WillShowUI>OnError</WillShowUI>${key_xml}</ProductKey></UserData>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>${name^^}</ComputerName><TimeZone>UTC</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <OOBE><HideEULAPage>true</HideEULAPage><HideLocalAccountScreen>true</HideLocalAccountScreen><HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><HideOnlineAccountScreens>true</HideOnlineAccountScreens><HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
+      <UserAccounts><AdministratorPassword><Value>${PASSWORD}</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>
+      <AutoLogon><Enabled>true</Enabled><Username>Administrator</Username><Password><Value>${PASSWORD}</Value><PlainText>true</PlainText></Password><LogonCount>3</LogonCount></AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>cmd /c powershell -NoProfile -Command "Set-NetFirewallProfile -All -Enabled False"</CommandLine><Description>Disable firewall</Description></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>cmd /c powershell -NoProfile -Command "\$a=(Get-NetAdapter|Select -First 1).Name; New-NetIPAddress -InterfaceAlias \$a -IPAddress ${ip} -PrefixLength 24 -DefaultGateway ${HOST_IP} -EA SilentlyContinue; Set-DnsClientServerAddress -InterfaceAlias \$a -ServerAddresses ${HOST_IP},8.8.8.8"</CommandLine><Description>Static IP</Description></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>cmd /c powershell -NoProfile -Command "Enable-PSRemoting -Force -SkipNetworkProfileCheck; Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force"</CommandLine><Description>WinRM</Description></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>4</Order><CommandLine>cmd /c powershell -NoProfile -Command "Set-ExecutionPolicy RemoteSigned -Force"</CommandLine><Description>ExecPolicy</Description></SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
+AUEOF
+
+    # ── floppy image ──
+    local floppy="$LAB/images/${name}_floppy.img"
+    dd if=/dev/zero of="$floppy" bs=1024 count=1440 2>/dev/null
+    mkfs.fat "$floppy" >/dev/null 2>&1
+    local mnt=$(mktemp -d)
+    sudo mount -o loop "$floppy" "$mnt"
+    sudo cp "$au_xml" "$mnt/autounattend.xml"
+    sudo umount "$mnt"; rmdir "$mnt"
+
+    # ── launch QEMU ──
+    tap_ensure "$tap"
+    rm -f "$qmp_sock"
+    qemu-system-x86_64 \
+        -name "$name" -machine pc,accel=kvm -cpu host -smp "$cpus" -m "$ram" \
+        -hda "$dimg" -cdrom "$iso" -fda "$floppy" -boot d \
+        -device e1000e,netdev=n0,mac="$mac" \
+        -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
+        -vga std -display none -vnc "127.0.0.1:${vnc_num}" \
+        -usb -device usb-tablet \
+        -qmp "unix:${qmp_sock},server,nowait" \
+        -daemonize 2>&1
+
+    _db_set "$name" ip "$ip"
+    _db_set "$name" build "${build:-unknown}"
+    _db_set "$name" tap "$tap"
+    _db_set "$name" vnc "$((5900+vnc_num))"
+    _db_set "$name" status installing
+
+    ok "VM '$name' launched (PID $(vm_pid "$name"))"
+    log "VNC: 127.0.0.1:$((5900+vnc_num))"
+    log "Waiting for OS install + first boot..."
+
+    # ── wait for network ──
+    local t=0
+    while (( t < 2400 )); do
+        if ping -c1 -W2 "$ip" &>/dev/null; then
+            break
+        fi
+        # check DHCP fallback
+        local dhcp_ip=$(ip neigh show dev "$BRIDGE" 2>/dev/null \
+            | grep "$mac" | grep -v FAILED | grep -v INCOMPLETE | awk '{print $1}' | head -1)
+        if [[ -n "$dhcp_ip" && "$dhcp_ip" != "$ip" ]]; then
+            log "Found at DHCP $dhcp_ip — setting static IP $ip..."
+            vm_exec "$dhcp_ip" "powershell -Command \"Set-NetFirewallProfile -All -Enabled False; \$a=(Get-NetAdapter|Select -First 1).Name; New-NetIPAddress -InterfaceAlias \$a -IPAddress $ip -PrefixLength 24 -DefaultGateway $HOST_IP -EA SilentlyContinue\"" &>/dev/null || true
+            sleep 10
+        fi
+        sleep 15; t=$((t+15))
+        (( t % 120 == 0 )) && log "Still installing... (${t}s)"
+    done
+
+    if ! ping -c1 -W2 "$ip" &>/dev/null; then
+        warn "VM not reachable at $ip after ${t}s. Check VNC."
+        return 1
+    fi
+
+    # wait for SMB
+    local st=0
+    while ! nmap -sT -Pn -p445 "$ip" 2>/dev/null | grep -q "open"; do
+        sleep 5; st=$((st+5)); (( st >= 180 )) && break
+    done
+
+    _db_set "$name" status running
+    local ver=$(vm_exec "$ip" 'powershell -Command "(Get-Item C:\Windows\System32\ntoskrnl.exe).VersionInfo.FileVersion"' 2>/dev/null | tail -1)
+    [[ -n "$ver" ]] && _db_set "$name" version "$ver"
+    ok "VM '$name' ready at $ip (version: ${ver:-?})"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: tools
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_tools() {
+    local name="" profile="exploit-dev"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --profile|-p) profile="$2"; shift 2;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "tools: --vm <name> required"
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    log "Installing tools ($profile) on $name ($ip)..."
+
+    # ── core: crash dumps, symbols, netlogon debug ──
+    log "Configuring crash dumps and symbols..."
+    vm_exec "$ip" 'powershell -Command "
+mkdir C:\Tools,C:\Symbols,C:\CrashDumps -Force >$null
+[Environment]::SetEnvironmentVariable(\"_NT_SYMBOL_PATH\",\"srv*C:\Symbols*https://msdl.microsoft.com/download/symbols\",\"Machine\")
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name CrashDumpEnabled -Value 1
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name AutoReboot -Value 0
+$p=\"HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\lsass.exe\"
+New-Item -Path $p -Force >$null
+Set-ItemProperty $p -Name DumpFolder -Value C:\CrashDumps -Type ExpandString
+Set-ItemProperty $p -Name DumpType -Value 2 -Type DWord
+Set-ItemProperty $p -Name DumpCount -Value 10 -Type DWord
+nltest /dbflag:0x2080ffff 2>$null
+Write-Host OK
+"' 2>/dev/null
+    ok "Crash dumps + symbol path + netlogon debug configured"
+
+    if [[ "$profile" == "minimal" ]]; then
+        ok "Minimal profile done"; return 0
+    fi
+
+    # ── sysinternals ──
+    log "Installing Sysinternals..."
+    vm_exec "$ip" 'powershell -Command "
+Invoke-WebRequest https://download.sysinternals.com/files/SysinternalsSuite.zip -OutFile C:\Tools\ss.zip -UseBasicParsing
+Expand-Archive C:\Tools\ss.zip C:\Tools\Sysinternals -Force; Remove-Item C:\Tools\ss.zip
+Write-Host OK
+"' 2>/dev/null
+    ok "Sysinternals installed"
+
+    # ── x64dbg ──
+    log "Installing x64dbg..."
+    vm_exec "$ip" 'powershell -Command "
+try {
+    $r=Invoke-RestMethod https://api.github.com/repos/x64dbg/x64dbg/releases/latest -UseBasicParsing
+    $a=$r.assets|?{$_.name -like \"snapshot_*.zip\"}|Select -First 1
+    if($a){Invoke-WebRequest $a.browser_download_url -OutFile C:\Tools\x64dbg.zip -UseBasicParsing; Expand-Archive C:\Tools\x64dbg.zip C:\Tools\x64dbg -Force; Remove-Item C:\Tools\x64dbg.zip; Write-Host OK}
+} catch { Write-Host SKIP }
+"' 2>/dev/null
+
+    # ── python ──
+    log "Installing Python..."
+    vm_exec "$ip" 'powershell -Command "
+$u=\"https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe\"
+Invoke-WebRequest $u -OutFile C:\Tools\pyinst.exe -UseBasicParsing
+Start-Process C:\Tools\pyinst.exe -ArgumentList \"/quiet\",\"InstallAllUsers=1\",\"PrependPath=1\" -Wait
+Remove-Item C:\Tools\pyinst.exe
+Write-Host OK
+"' 2>/dev/null
+    ok "Python installed"
+
+    if [[ "$profile" == "exploit-dev" || "$profile" == "re-only" ]]; then
+        # ── WinDbg ──
+        log "Installing WinDbg (attempting winget)..."
+        vm_exec "$ip" 'powershell -Command "
+try { winget install Microsoft.WinDbg --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null; Write-Host OK }
+catch { Write-Host SKIP-winget-unavailable }
+"' 2>/dev/null
+    fi
+
+    ok "Tools ($profile) installed on $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: ad
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_ad() {
+    local name="" domain="corp.local" netbios=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --domain|-d) domain="$2"; shift 2;;
+            --netbios) netbios="$2"; shift 2;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "ad: --vm <name> required"
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "VM '$name' not found"
+    [[ -z "$netbios" ]] && netbios=$(echo "$domain" | cut -d. -f1 | tr '[:lower:]' '[:upper:]')
+
+    log "Setting up AD DS on $name ($ip)"
+    log "  Domain: $domain  NetBIOS: $netbios"
+
+    # install role
+    vm_exec "$ip" 'powershell -Command "Install-WindowsFeature AD-Domain-Services -IncludeManagementTools"' 2>/dev/null | grep -i success
+    ok "AD DS role installed"
+
+    # promote
+    log "Promoting to DC (this takes several minutes + reboot)..."
+    vm_exec "$ip" "powershell -Command \"Import-Module ADDSDeployment; Install-ADDSForest -DomainName '$domain' -DomainNetbiosName '$netbios' -SafeModeAdministratorPassword (ConvertTo-SecureString '$PASSWORD' -AsPlainText -Force) -InstallDNS -Force\"" 2>/dev/null || true
+
+    # wait for reboot
+    log "Waiting for DC to reboot..."
+    sleep 15
+    local t=0
+    while ! ping -c1 -W2 "$ip" &>/dev/null; do
+        sleep 10; t=$((t+10)); (( t >= 300 )) && { warn "DC not back after 300s"; return 1; }
+    done
+    # wait for SMB
+    sleep 20
+    local st=0
+    while ! nmap -sT -Pn -p445 "$ip" 2>/dev/null | grep -q "open"; do
+        sleep 10; st=$((st+10)); (( st >= 120 )) && break
+    done
+
+    # fix DNS to self
+    vm_exec "$ip" "powershell -Command \"Set-DnsClientServerAddress -InterfaceAlias (Get-NetAdapter|Select -First 1 -Expand Name) -ServerAddresses 127.0.0.1,$HOST_IP\"" 2>/dev/null || true
+
+    _db_set "$name" domain "$domain"
+    _db_set "$name" netbios "$netbios"
+    ok "DC promotion complete: $domain"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: update (apply a Windows CU to a running VM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_update() {
+    local name="" kb="" msu=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v) name="$2"; shift 2;;
+            --kb|-k) kb="$2"; shift 2;;
+            --msu|-m) msu="$2"; shift 2;;
+            *) name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" ]] && die "update: --vm <name> required"
+    [[ -z "$kb" && -z "$msu" ]] && die "update: --kb <KB number> or --msu <path> required"
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    if [[ -n "$msu" && -f "$msu" ]]; then
+        log "Uploading $msu to VM..."
+        vm_upload "$ip" "$msu" "Windows/Temp/$(basename "$msu")"
+        kb=$(basename "$msu" .msu)
+    fi
+
+    log "Installing $kb on $name..."
+    vm_exec "$ip" "powershell -Command \"
+        \$msu = Get-ChildItem C:\\Windows\\Temp\\*.msu | Select -First 1
+        if (\$msu) {
+            Write-Host ('Installing ' + \$msu.Name + '...')
+            wusa.exe \$msu.FullName /quiet /norestart
+            Write-Host 'Done — reboot required'
+        } else {
+            Write-Host 'No MSU found in C:\\Windows\\Temp\\'
+        }
+    \"" 2>/dev/null
+
+    ok "Update applied. Reboot with: xdev-lab stop $name && xdev-lab start $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: snapshot
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_snapshot() {
+    local name="" action="" snap=""
+    for arg in "$@"; do
+        case "$arg" in
+            create|restore|list|delete) action="$arg";;
+            *) [[ -z "$name" ]] && name="$arg" || snap="$arg";;
+        esac
+    done
+    [[ -z "$name" || -z "$action" ]] && die "Usage: xdev-lab snapshot <name> <create|restore|list|delete> [snap]"
+    local d=$(vm_disk "$name")
+    [[ -f "$d" ]] || die "Disk not found: $d"
+
+    case "$action" in
+        create)
+            [[ -z "$snap" ]] && die "Snapshot name required"
+            vm_running "$name" && die "Stop VM first"
+            qemu-img snapshot -c "$snap" "$d"; ok "Snapshot '$snap' created";;
+        restore)
+            [[ -z "$snap" ]] && die "Snapshot name required"
+            vm_running "$name" && die "Stop VM first"
+            qemu-img snapshot -a "$snap" "$d"; ok "Restored '$snap'";;
+        list)
+            qemu-img snapshot -l "$d" 2>/dev/null || echo "No snapshots";;
+        delete)
+            [[ -z "$snap" ]] && die "Snapshot name required"
+            qemu-img snapshot -d "$snap" "$d"; ok "Deleted '$snap'";;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: start / stop / destroy
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_start() {
+    local name="${1:?Usage: xdev-lab start <name>}"
+    local d=$(vm_disk "$name")
+    [[ -f "$d" ]] || die "Disk not found: $d"
+    vm_running "$name" && { ok "'$name' already running"; return 0; }
+
+    net_ensure
+    local ip=$(vm_ip "$name") tap="tap-${name}"
+    local last=${ip##*.}
+    local vnc=$((last - 8)); (( vnc < 1 )) && vnc=2
+    local qmp=$(vm_qmp "$name")
+    tap_ensure "$tap"; rm -f "$qmp"
+
+    qemu-system-x86_64 \
+        -name "$name" -machine pc,accel=kvm -cpu host -smp 2 -m 4096 \
+        -hda "$d" -boot c \
+        -device e1000e,netdev=n0,mac="52:54:00:dc:00:$(printf '%02x' "$last")" \
+        -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
+        -vga std -display none -vnc "127.0.0.1:${vnc}" \
+        -usb -device usb-tablet \
+        -qmp "unix:${qmp},server,nowait" \
+        -daemonize 2>&1
+
+    _db_set "$name" status running
+    ok "'$name' started (VNC: 127.0.0.1:$((5900+vnc)))"
+}
+
+cmd_stop() {
+    local name="${1:?Usage: xdev-lab stop <name>}" force="${2:-}"
+    local pid=$(vm_pid "$name")
+    [[ -z "$pid" ]] && { ok "'$name' not running"; return 0; }
+
+    if [[ "$force" == "--force" ]]; then
+        kill -9 "$pid" 2>/dev/null; ok "Force-killed '$name'"; return 0
+    fi
+
+    qmp "$name" '{"execute":"system_powerdown"}' &>/dev/null
+    local w=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 2; w=$((w+2)); (( w >= 60 )) && { kill -9 "$pid" 2>/dev/null; break; }
+    done
+    _db_set "$name" status stopped
+    ok "'$name' stopped"
+}
+
+cmd_destroy() {
+    local name="${1:?Usage: xdev-lab destroy <name>}"
+    cmd_stop "$name" --force 2>/dev/null || true
+    rm -f "$(vm_disk "$name")" "$LAB/images/${name}_"*
+    sudo ip link del "tap-${name}" 2>/dev/null || true
+    _db_del "$name"
+    ok "'$name' destroyed"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: list / exec / extract / screenshot
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_list() {
+    [[ ! -f "$DB" ]] && { echo "No VMs."; return; }
+    python3 -c "
+import json,subprocess as sp
+db=json.load(open('$DB'))
+print(f'{\"NAME\":<18}{\"IP\":<16}{\"BUILD\":<16}{\"STATUS\":<10}{\"VERSION\":<24}{\"DOMAIN\"}')
+print('-'*110)
+for n,i in sorted(db.items()):
+    run='running' if sp.run(['pgrep','-f',f'qemu.*-name {n}'],capture_output=True).returncode==0 else 'stopped'
+    ver=i.get('version','?')[:22]
+    dom=i.get('domain','-')
+    if len(dom)>35: dom=dom[:15]+'...'+dom[-15:]
+    print(f'{n:<18}{i.get(\"ip\",\"?\"):<16}{i.get(\"build\",\"?\"):<16}{run:<10}{ver:<24}{dom}')
+"
+}
+
+cmd_exec() {
+    local name="${1:?Usage: xdev-lab exec <name> <cmd>}"; shift
+    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    vm_exec "$ip" "$*"
+}
+
+cmd_extract() {
+    local name="${1:?}" remote="${2:?}" dst="${3:?}"
+    local ip=$(vm_ip "$name"); [[ -z "$ip" ]] && die "VM '$name' not found"
+    vm_download "$ip" "$remote" "$dst"
+    ok "$remote -> $dst"
+}
+
+cmd_screenshot() {
+    local name="${1:?}" out="${2:-/tmp/${1}-screen.png}"
+    qmp "$name" '{"execute":"screendump","arguments":{"filename":"/tmp/_qmp_screen.ppm"}}' >/dev/null
+    convert /tmp/_qmp_screen.ppm "$out" 2>/dev/null || cp /tmp/_qmp_screen.ppm "$out"
+    ok "Screenshot: $out"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: create (all-in-one)
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_create() {
+    local build="" name="" tools="" domain="" edition=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --build|-b) build="$2"; shift 2;;
+            --name|-n)  name="$2"; shift 2;;
+            --tools|-t) tools="$2"; shift 2;;
+            --ad)       domain="$2"; shift 2;;
+            --edition)  edition="$2"; shift 2;;
+            *) die "create: unknown flag $1";;
+        esac
+    done
+    [[ -z "$build" ]] && die "create: --build required"
+    [[ -z "$name" ]] && name="$(build_family "$build")-${build}"
+
+    cmd_iso --build "$build" ${edition:+--edition "$edition"}
+    cmd_vm --name "$name" --build "$build"
+    [[ -n "$tools" ]] && cmd_tools --vm "$name" --profile "$tools"
+    [[ -n "$domain" ]] && cmd_ad --vm "$name" --domain "$domain"
+
+    ok "Lab VM '$name' complete (build $build)"
+    cmd_list
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISPATCH
+# ═══════════════════════════════════════════════════════════════════════════
+
+case "${1:-help}" in
+    iso)        shift; cmd_iso "$@";;
+    vm)         shift; cmd_vm "$@";;
+    tools)      shift; cmd_tools "$@";;
+    ad)         shift; cmd_ad "$@";;
+    update)     shift; cmd_update "$@";;
+    snapshot)   shift; cmd_snapshot "$@";;
+    start)      shift; cmd_start "$@";;
+    stop)       shift; cmd_stop "$@";;
+    destroy)    shift; cmd_destroy "$@";;
+    list)       shift; cmd_list "$@";;
+    exec)       shift; cmd_exec "$@";;
+    extract)    shift; cmd_extract "$@";;
+    screenshot) shift; cmd_screenshot "$@";;
+    create)     shift; cmd_create "$@";;
+    help|--help|-h)
+        cat << 'HELP'
+xdev-lab — Windows exploit development lab on QEMU/KVM
+
+QUICK START:
+  xdev-lab create --build 26100.32690 --name ws2025 --tools exploit-dev --ad corp.local
+
+COMMANDS:
+  create    All-in-one: ISO + VM + tools + optional AD
+  iso       Build exact-build ISO via UUP dump
+  vm        Create VM with unattended install
+  tools     Install exploit dev tools (FLARE-VM pattern)
+  ad        Promote to Domain Controller
+  update    Apply a Windows CU (.msu) to a running VM
+  snapshot  create|restore|list|delete QCOW2 snapshots
+  start     Start a stopped VM
+  stop      Graceful shutdown (--force to kill)
+  destroy   Delete VM completely
+  list      Show all VMs with status
+  exec      Run command via wmiexec (pass-the-hash)
+  extract   Download file from VM via SMB
+  screenshot  QMP screendump
+
+BUILD FAMILIES:
+  26100 → WS2025    20348 → WS2022    17763 → WS2019
+  22631 → Win11     19041 → Win10
+
+TOOL PROFILES:
+  exploit-dev  Crash dumps, symbols, Sysinternals, x64dbg, Python, WinDbg
+  re-only      Crash dumps, symbols, Sysinternals, x64dbg
+  minimal      Crash dumps, symbols only
+
+EXAMPLES:
+  xdev-lab iso --build 26100.32690
+  xdev-lab vm --name test --build 26100.32690 --ip 10.10.10.30
+  xdev-lab tools --vm test --profile exploit-dev
+  xdev-lab ad --vm test --domain corp.local
+  xdev-lab exec test 'powershell -Command "Get-ADDomain"'
+  xdev-lab extract test Windows/System32/netlogon.dll ./netlogon.dll
+  xdev-lab snapshot test create pre-exploit
+HELP
+        ;;
+    *) die "Unknown: $1 (try 'xdev-lab help')";;
+esac

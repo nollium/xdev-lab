@@ -11,7 +11,7 @@
 #   xdev-lab vm     --name test --iso /path/to/iso [--ip 10.10.10.30]
 #   xdev-lab tools  --vm test [--profile exploit-dev]
 #   xdev-lab ad     --vm test --domain corp.local
-#   xdev-lab update --vm test --kb KB5082063
+#   xdev-lab update --vm test --msu /path/to/update.msu
 #   xdev-lab list
 #   xdev-lab start|stop|destroy <name>
 #   xdev-lab exec   <name> <command>
@@ -421,7 +421,8 @@ for b,(d2,tt) in sorted(near.items(),key=lambda x:x[1][0])[:8]:
         mkdir -p "$w/UUPs"
         log "Downloading Windows packages from Microsoft (this takes a while)..."
         aria2c --no-conf --console-log-level=warn \
-            -x16 -s16 -j5 -c -R -d"$w/UUPs" -i"$w/aria2_script.txt" 2>&1 | tail -5
+            -x16 -s16 -j5 -c -R -d"$w/UUPs" -i"$w/aria2_script.txt" 2>&1 | tail -5 \
+            || warn "aria2c exited with errors — some packages may be missing"
     fi
     ok "Packages: $(ls "$w/UUPs/" | wc -l) files, $(du -sh "$w/UUPs/" | cut -f1)"
 
@@ -786,7 +787,7 @@ cmd_update() {
         esac
     done
     [[ -z "$name" ]] && die "update: --vm <name> required"
-    [[ -z "$kb" && -z "$msu" ]] && die "update: --kb <KB number> or --msu <path> required"
+    [[ -z "$msu" ]] && die "update: --msu <path-or-url> required (optionally with --kb <name>)"
     local ip; ip=$(require_vm "$name")
 
     if [[ -n "$msu" ]]; then
@@ -1017,6 +1018,33 @@ cmd_screenshot() {
     qmp "$name" '{"execute":"screendump","arguments":{"filename":"/tmp/_qmp_screen.ppm"}}' >/dev/null
     convert /tmp/_qmp_screen.ppm "$out" 2>/dev/null || cp /tmp/_qmp_screen.ppm "$out"
     ok "Screenshot: $out"
+}
+
+cmd_wait() {
+    local name="" timeout_s=300
+    for arg in "$@"; do
+        case "$arg" in
+            --timeout=*) timeout_s="${arg#*=}";;
+            *) name="${name:-$arg}";;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab wait <name> [--timeout=300]"
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "VM '$name' not found"
+
+    log "Waiting for $name ($ip) to respond (timeout: ${timeout_s}s)..."
+    local t=0
+    while (( t < timeout_s )); do
+        if ping -c1 -W2 "$ip" &>/dev/null; then
+            if nmap -sT -Pn -p445 "$ip" 2>/dev/null | grep -q "open"; then
+                ok "$name is ready (${t}s)"
+                return 0
+            fi
+        fi
+        sleep 5; t=$((t+5))
+        (( t % 30 == 0 )) && log "Still waiting... (${t}s)"
+    done
+    die "$name not ready after ${timeout_s}s"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1443,6 +1471,7 @@ case "${1:-help}" in
     exec)         shift; cmd_exec "$@";;
     extract)      shift; cmd_extract "$@";;
     screenshot)   shift; cmd_screenshot "$@";;
+    wait)         shift; cmd_wait "$@";;
     create)       shift; cmd_create "$@";;
     help|--help|-h)
         cat << 'HELP'
@@ -1467,6 +1496,7 @@ COMMANDS:
   stop         Graceful shutdown (--force to kill)
   destroy      Delete VM completely
   list         Show all VMs with status
+  wait         Wait for VM to become responsive [--timeout=300]
   exec         Run command via wmiexec (pass-the-hash)
   extract      Download file from VM via SMB
   screenshot   QMP screendump

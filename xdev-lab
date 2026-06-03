@@ -970,6 +970,22 @@ cmd_stop() {
     ok "'$name' stopped"
 }
 
+cmd_reboot() {
+    local name=""
+    local -a start_args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --*) start_args+=("$arg");;
+            *) name="${name:-$arg}";;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab reboot <name> [--cpus N] [--debug gdb]"
+    log "Rebooting $name..."
+    cmd_stop "$name" --force
+    sleep 2
+    cmd_start "$name" "${start_args[@]}"
+}
+
 cmd_destroy() {
     local name="${1:?Usage: xdev-lab destroy <name>}"
     cmd_stop "$name" --force 2>/dev/null || true
@@ -1466,6 +1482,7 @@ case "${1:-help}" in
     snapshot)     shift; cmd_snapshot "$@";;
     start)        shift; cmd_start "$@";;
     stop)         shift; cmd_stop "$@";;
+    reboot)       shift; cmd_reboot "$@";;
     destroy)      shift; cmd_destroy "$@";;
     list)         shift; cmd_list "$@";;
     exec)         shift; cmd_exec "$@";;
@@ -1494,6 +1511,7 @@ COMMANDS:
   snapshot     create|restore|list|delete QCOW2 snapshots
   start        Start VM [--debug gdb|serial|both] [--cpus N] [--ram M] [--qemu-extra '...']
   stop         Graceful shutdown (--force to kill)
+  reboot       Stop + start (passes flags to start, e.g. --debug gdb)
   destroy      Delete VM completely
   list         Show all VMs with status
   wait         Wait for VM to become responsive [--timeout=300]

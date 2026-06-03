@@ -1452,7 +1452,7 @@ COMMANDS:
   offsets      Calculate exploit offsets from target binaries
   exploit-test Run PoC with monitoring (PCAP, crash dump, shell capture)
   snapshot     create|restore|list|delete QCOW2 snapshots
-  start        Start VM [--debug gdb|serial|both] [--cpus N] [--qemu-extra '...']
+  start        Start VM [--debug gdb|serial|both] [--cpus N] [--ram M] [--qemu-extra '...']
   stop         Graceful shutdown (--force to kill)
   destroy      Delete VM completely
   list         Show all VMs with status

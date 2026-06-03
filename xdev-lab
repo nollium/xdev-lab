@@ -1070,6 +1070,15 @@ cmd_exec() {
     vm_exec "$ip" "$*"
 }
 
+cmd_upload() {
+    [[ $# -lt 3 ]] && die "Usage: xdev-lab upload <name> <local-path> <remote-path>"
+    local name="$1" src="$2" dst="$3"
+    [[ -f "$src" ]] || die "File not found: $src"
+    local ip; ip=$(require_vm "$name")
+    vm_upload "$ip" "$src" "$dst"
+    ok "$src -> $dst"
+}
+
 cmd_extract() {
     [[ $# -lt 3 ]] && die "Usage: xdev-lab extract <name> <remote-path> <local-path>"
     local name="$1" remote="$2" dst="$3"
@@ -1736,6 +1745,7 @@ case "${1:-help}" in
     destroy)      shift; cmd_destroy "$@";;
     list)         shift; cmd_list "$@";;
     exec)         shift; cmd_exec "$@";;
+    upload)       shift; cmd_upload "$@";;
     extract)      shift; cmd_extract "$@";;
     screenshot)   shift; cmd_screenshot "$@";;
     wait)         shift; cmd_wait "$@";;
@@ -1767,6 +1777,7 @@ COMMANDS:
   list         Show all VMs with status
   wait         Wait for VM to become responsive [--timeout=300]
   exec         Run command via wmiexec (pass-the-hash)
+  upload       Upload file to VM via SMB
   extract      Download file from VM via SMB
   screenshot   QMP screendump
 

@@ -72,7 +72,7 @@ json.dump(db,open(p,'w'),indent=2)
 
 vm_ip()  { _db_get "$1" ip; }
 vm_qmp() { echo "/tmp/qemu-${1}-qmp.sock"; }
-vm_pid() { pgrep -f "qemu.*-name $1 " 2>/dev/null | head -1; }
+vm_pid() { pgrep -f "qemu-system.*-name ${1}( |$)" 2>/dev/null | head -1; }
 vm_running() { [ -n "$(vm_pid "$1")" ]; }
 vm_disk() { echo "$LAB/images/${1}.qcow2"; }
 
@@ -104,8 +104,10 @@ conn.close()
 
 vm_exec() {
     local ip="$1"; shift
-    wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1 \
-        | grep -v "^Impacket\|^\[\*\] SMB"
+    local _out _rc=0
+    _out=$(wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1) || _rc=$?
+    printf '%s\n' "$_out" | grep -v "^Impacket\|^\[\*\] SMB"
+    return $_rc
 }
 
 vm_upload() {
@@ -176,10 +178,7 @@ net_ensure() {
 
 tap_ensure() {
     local tap="$1"
-    # Kill any QEMU still holding this TAP
     if ip link show "$tap" &>/dev/null; then
-        local holder=$(ip link show "$tap" 2>/dev/null | grep -oP 'master \K\S+')
-        # If the tap exists but is DOWN/no-carrier, delete and recreate
         if ip link show "$tap" 2>/dev/null | grep -q "NO-CARRIER\|state DOWN"; then
             sudo ip link del "$tap" 2>/dev/null || true
         fi
@@ -942,12 +941,23 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local name="${1:?Usage: xdev-lab stop <name>}" force="${2:-}"
+    local name="" force=""
+    for arg in "$@"; do
+        case "$arg" in
+            --force|-f) force=1;;
+            *) name="${name:-$arg}";;
+        esac
+    done
+    [[ -z "$name" ]] && die "Usage: xdev-lab stop <name> [--force]"
     local pid=$(vm_pid "$name")
-    [[ -z "$pid" ]] && { ok "'$name' not running"; return 0; }
+    [[ -z "$pid" ]] && { ok "'$name' not running"; _db_set "$name" status stopped; return 0; }
 
-    if [[ "$force" == "--force" ]]; then
-        kill -9 "$pid" 2>/dev/null; ok "Force-killed '$name'"; return 0
+    if [[ -n "$force" ]]; then
+        kill -9 "$pid" 2>/dev/null
+        sleep 1
+        _db_set "$name" status stopped
+        ok "Force-killed '$name'"
+        return 0
     fi
 
     qmp "$name" '{"execute":"system_powerdown"}' &>/dev/null
@@ -995,7 +1005,8 @@ cmd_exec() {
 }
 
 cmd_extract() {
-    local name="${1:?}" remote="${2:?}" dst="${3:?}"
+    [[ $# -lt 3 ]] && die "Usage: xdev-lab extract <name> <remote-path> <local-path>"
+    local name="$1" remote="$2" dst="$3"
     local ip; ip=$(require_vm "$name")
     vm_download "$ip" "$remote" "$dst"
     ok "$remote -> $dst"

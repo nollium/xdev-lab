@@ -263,12 +263,14 @@ detect_iso_config() {
 }
 
 next_ip() {
-    python3 -c "
+    _DB_PATH="$DB" _SUBNET="$SUBNET" python3 -c "
 import json,os
-db=json.load(open('$DB')) if os.path.exists('$DB') else {}
+p=os.environ['_DB_PATH']
+db=json.load(open(p)) if os.path.exists(p) else {}
 used={int(v.get('ip','0.0.0.0').split('.')[-1]) for v in db.values() if v.get('ip')}
+subnet=os.environ['_SUBNET']
 for i in range(10,250):
-    if i not in used: print('${SUBNET}.'+str(i)); break
+    if i not in used: print(f'{subnet}.{i}'); break
 " 2>/dev/null
 }
 
@@ -872,18 +874,19 @@ cmd_snapshot() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_start() {
-    local name="" debug="" extra="" cpus=""
+    local name="" debug="" extra="" cpus="" ram=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --debug)      debug="${2:-gdb}"; shift 2;;
             --qemu-extra) extra="$2"; shift 2;;
             --cpus)       cpus="$2"; shift 2;;
+            --ram)        ram="$2"; shift 2;;
             --break)      extra="${extra} -S"; shift;;
             -*)           die "start: unknown flag $1";;
             *)            name="${name:-$1}"; shift;;
         esac
     done
-    [[ -z "$name" ]] && die "Usage: xdev-lab start <name> [--debug gdb|serial|both] [--cpus N] [--qemu-extra '...']"
+    [[ -z "$name" ]] && die "Usage: xdev-lab start <name> [--debug gdb|serial|both] [--cpus N] [--ram M] [--qemu-extra '...']"
 
     local d=$(vm_disk "$name")
     [[ -f "$d" ]] || die "Disk not found: $d"
@@ -895,7 +898,7 @@ cmd_start() {
     local last=${ip##*.}
     local vnc=$((last - 8)); (( vnc < 1 )) && vnc=2
     local qmp_sock=$(vm_qmp "$name")
-    local smp="${cpus:-2}"
+    local smp="${cpus:-2}" mem="${ram:-4096}"
     tap_ensure "$tap"; rm -f "$qmp_sock"
 
     local debug_flags=""
@@ -907,7 +910,7 @@ cmd_start() {
 
     local qemu_start_out
     qemu_start_out=$(qemu-system-x86_64 \
-        -name "$name" -machine pc,accel=kvm -cpu host -smp "$smp" -m 4096 \
+        -name "$name" -machine pc,accel=kvm -cpu host -smp "$smp" -m "$mem" \
         -hda "$d" -boot c \
         -device e1000e,netdev=n0,mac="52:54:00:dc:00:$(printf '%02x' "$last")" \
         -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
@@ -971,9 +974,9 @@ cmd_destroy() {
 
 cmd_list() {
     [[ ! -f "$DB" ]] && { echo "No VMs."; return; }
-    python3 -c "
-import json,subprocess as sp
-db=json.load(open('$DB'))
+    _DB_PATH="$DB" python3 -c "
+import json,subprocess as sp,os
+db=json.load(open(os.environ['_DB_PATH']))
 print(f'{\"NAME\":<18}{\"IP\":<16}{\"BUILD\":<16}{\"STATUS\":<10}{\"VERSION\":<24}{\"DOMAIN\"}')
 print('-'*110)
 for n,i in sorted(db.items()):

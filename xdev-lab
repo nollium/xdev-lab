@@ -1083,12 +1083,12 @@ cmd_feature() {
 
     if $do_list; then
         log "Querying features on $name ($ip)..."
-        # Run simple commands separately to avoid wmiexec timeout on complex PS
-        echo "  Firewall:        $(vm_exec "$ip" 'powershell -Command "(Get-NetFirewallProfile|Select -First 1).Enabled"' 2>/dev/null | tail -1)"
-        echo "  RDP:             $(vm_exec "$ip" 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections 2>nul' 2>/dev/null | grep -oP '0x\d')"
-        echo "  KernelDebug:     $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr debug' 2>/dev/null | tail -1)"
-        echo "  NumProc:         $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr numproc' 2>/dev/null | tail -1)"
-        echo "  TestSigning:     $(vm_exec "$ip" 'bcdedit /enum {current} 2>nul | findstr testsigning' 2>/dev/null | tail -1)"
+        _feat_q() { vm_exec "$ip" "$1" 2>/dev/null | tr -d '\r' | grep -v '^$' | tail -1; }
+        echo "  Firewall:        $(_feat_q 'powershell -Command "(Get-NetFirewallProfile|Select -First 1).Enabled"')"
+        echo "  RDP:             $(vm_exec "$ip" 'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections 2>nul' 2>/dev/null | tr -d '\r' | grep -oP '0x\d')"
+        echo "  KernelDebug:     $(_feat_q 'bcdedit /enum {current} 2>nul | findstr debug')"
+        echo "  NumProc:         $(_feat_q 'bcdedit /enum {current} 2>nul | findstr numproc')"
+        echo "  TestSigning:     $(_feat_q 'bcdedit /enum {current} 2>nul | findstr testsigning')"
         return 0
     fi
 

@@ -102,10 +102,12 @@ conn.close()
 " 2>/dev/null
 }
 
+VM_EXEC_TIMEOUT=120
+
 vm_exec() {
     local ip="$1"; shift
     local _out _rc=0
-    _out=$(timeout 60 wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1) || _rc=$?
+    _out=$(timeout "$VM_EXEC_TIMEOUT" wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1) || _rc=$?
     printf '%s\n' "$_out" | grep -v "^Impacket\|^\[\*\] SMB"
     return $_rc
 }
@@ -645,6 +647,9 @@ AUEOF
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_tools() {
+    local saved_timeout="$VM_EXEC_TIMEOUT"
+    VM_EXEC_TIMEOUT=300
+    trap 'VM_EXEC_TIMEOUT=$saved_timeout' RETURN
     local name="" profile="exploit-dev"
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -709,13 +714,57 @@ Write-Host OK
 "' 2>/dev/null
     ok "Python installed"
 
-    if [[ "$profile" == "exploit-dev" || "$profile" == "re-only" ]]; then
-        # ── WinDbg ──
-        log "Installing WinDbg (attempting winget)..."
+    if [[ "$profile" == "exploit-dev" || "$profile" == "re-only" || "$profile" == "kernel-debug" ]]; then
+        # ── WinDbg (SDK debugger — works on all Windows versions) ──
+        log "Installing Windows Debugging Tools..."
         vm_exec "$ip" 'powershell -Command "
-try { winget install Microsoft.WinDbg --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null; Write-Host OK }
-catch { Write-Host SKIP-winget-unavailable }
+$dbgPath = \"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\windbg.exe\"
+if (Test-Path $dbgPath) { Write-Host ALREADY-INSTALLED; return }
+try {
+    $w = Get-Command winget -EA SilentlyContinue
+    if ($w) { winget install Microsoft.WinDbg --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null; Write-Host OK-winget; return }
+} catch {}
+$url = \"https://download.microsoft.com/download/1/9/0/190da708-e2a0-49d3-ab1b-f9b42bcf4c5d/windowssdk/winsdksetup.exe\"
+Invoke-WebRequest $url -OutFile C:\Tools\winsdksetup.exe -UseBasicParsing
+Start-Process C:\Tools\winsdksetup.exe -ArgumentList \"/features OptionId.WindowsDesktopDebuggers /q /norestart\" -Wait
+Remove-Item C:\Tools\winsdksetup.exe -Force
+Write-Host OK-sdk
 "' 2>/dev/null
+        ok "Windows Debugging Tools installed"
+    fi
+
+    if [[ "$profile" == "kernel-debug" ]]; then
+        # ── Driver Verifier: Special Pool for srvnet/srv2 ──
+        log "Configuring Driver Verifier (Special Pool for srvnet.sys + srv2.sys)..."
+        vm_exec "$ip" 'powershell -Command "
+verifier /standard /driver srvnet.sys srv2.sys
+verifier /flags 0x1 /driver srvnet.sys srv2.sys
+Write-Host OK
+"' 2>/dev/null
+        ok "Driver Verifier + Special Pool enabled for srvnet.sys, srv2.sys"
+
+        # ── Complete memory dump ──
+        log "Configuring complete memory dumps..."
+        vm_exec "$ip" 'powershell -Command "
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name CrashDumpEnabled -Value 1
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name AutoReboot -Value 0
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name AlwaysKeepMemoryDump -Value 1
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name Overwrite -Value 0
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl -Name MinidumpsCount -Value 50
+bcdedit /set {current} recoveryenabled No
+Write-Host OK
+"' 2>/dev/null
+        ok "Complete memory dump configured (no auto-reboot, no recovery)"
+
+        # ── Kernel debug over serial ──
+        log "Enabling kernel debugging (serial COM1 @ 115200)..."
+        vm_exec "$ip" 'powershell -Command "
+bcdedit /debug on
+bcdedit /dbgsettings serial debugport:1 baudrate:115200
+Write-Host OK
+"' 2>/dev/null
+        ok "Kernel debugging enabled (serial COM1)"
+        warn "Reboot required: xdev-lab reboot $name --debug serial"
     fi
 
     ok "Tools ($profile) installed on $name"
@@ -1466,6 +1515,206 @@ cmd_exploit_test() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: analyze — crash dump analysis
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ensure_host_tools() {
+    local venv="$LAB/.venv"
+    if [[ ! -f "$venv/bin/vol" ]]; then
+        log "Installing analysis tools (one-time)..."
+        python3 -m venv "$venv" 2>/dev/null
+        "$venv/bin/pip" install -q volatility3 minidump pdbparse pefile 2>/dev/null
+        ok "Analysis venv: $venv"
+    fi
+    export PATH="$venv/bin:$PATH"
+}
+
+cmd_analyze() {
+    local name="" mode="auto" dumpfile="" outdir=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm|-v)   name="$2"; shift 2;;
+            --mode|-m) mode="$2"; shift 2;;
+            --dump|-d) dumpfile="$2"; shift 2;;
+            --out|-o)  outdir="$2"; shift 2;;
+            *)         name="${name:-$1}"; shift;;
+        esac
+    done
+    [[ -z "$name" && -z "$dumpfile" ]] && die "Usage: xdev-lab analyze --vm <name> [--mode pull|live|file] [--dump path]"
+    _ensure_host_tools
+    [[ -z "$outdir" ]] && outdir="$LAB/analysis/${name:-dump}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$outdir"
+
+    case "$mode" in
+        pull) _analyze_pull "$name" "$outdir";;
+        live) _analyze_live "$name" "$outdir";;
+        file) [[ -z "$dumpfile" ]] && die "analyze --mode file requires --dump <path>"
+              _analyze_dump "$dumpfile" "$outdir";;
+        auto)
+            if [[ -n "$name" ]] && vm_running "$name"; then
+                _analyze_pull "$name" "$outdir" 2>/dev/null || _analyze_live "$name" "$outdir"
+            elif [[ -n "$name" ]]; then
+                die "VM '$name' is not running. Start it first or use --mode file --dump <path>"
+            fi;;
+    esac
+    ok "Analysis complete: $outdir/"
+}
+
+_analyze_pull() {
+    local name="$1" outdir="$2"
+    local ip; ip=$(require_vm "$name")
+
+    log "Checking for crash dumps on $name..."
+
+    # MEMORY.DMP
+    local has_dmp
+    has_dmp=$(vm_exec "$ip" 'powershell -Command "if(Test-Path C:\Windows\MEMORY.DMP){(Get-Item C:\Windows\MEMORY.DMP).Length}else{0}"' 2>/dev/null | tr -d '\r' | grep -v '^$' | tail -1)
+    if [[ "${has_dmp:-0}" -gt 0 ]]; then
+        local dmp_mb=$(( ${has_dmp} / 1048576 ))
+        log "Downloading MEMORY.DMP (${dmp_mb}MB — this takes a while)..."
+        vm_download "$ip" "Windows/MEMORY.DMP" "$outdir/MEMORY.DMP"
+        ok "MEMORY.DMP: $outdir/MEMORY.DMP ($(du -h "$outdir/MEMORY.DMP" | cut -f1))"
+    else
+        log "No MEMORY.DMP found"
+    fi
+
+    # Minidumps
+    local minilist
+    minilist=$(vm_exec "$ip" 'powershell -Command "(Get-ChildItem C:\Windows\Minidump\*.dmp -EA SilentlyContinue).Name -join \",\""' 2>/dev/null | tr -d '\r' | grep -v '^$' | tail -1)
+    if [[ -n "$minilist" ]]; then
+        mkdir -p "$outdir/minidumps"
+        IFS=',' read -ra dmps <<< "$minilist"
+        log "Downloading ${#dmps[@]} minidump(s)..."
+        for d in "${dmps[@]}"; do
+            d=$(echo "$d" | xargs)
+            [[ -z "$d" ]] && continue
+            vm_download "$ip" "Windows/Minidump/$d" "$outdir/minidumps/$d" 2>/dev/null
+        done
+        ok "Minidumps: $outdir/minidumps/"
+    fi
+
+    # Bugcheck events
+    log "Extracting bugcheck events..."
+    vm_exec "$ip" 'powershell -Command "Get-WinEvent -FilterHashtable @{LogName=\"System\"; Id=1001} -MaxEvents 5 -EA SilentlyContinue | Format-List TimeCreated,Message"' > "$outdir/bugcheck_events.txt" 2>/dev/null
+    [[ -s "$outdir/bugcheck_events.txt" ]] && ok "Bugcheck events saved"
+
+    # Driver Verifier status
+    vm_exec "$ip" 'verifier /query' > "$outdir/verifier_status.txt" 2>/dev/null
+
+    # Analyze what we got
+    if [[ -f "$outdir/MEMORY.DMP" ]]; then
+        _analyze_dump "$outdir/MEMORY.DMP" "$outdir"
+    elif ls "$outdir/minidumps/"*.dmp &>/dev/null 2>&1; then
+        local latest=$(ls -t "$outdir/minidumps/"*.dmp | head -1)
+        _analyze_minidump "$latest" "$outdir"
+    else
+        warn "No crash dumps found. Run: xdev-lab tools --vm $name --profile kernel-debug"
+        return 1
+    fi
+}
+
+_analyze_live() {
+    local name="$1" outdir="$2"
+    local qmp_sock=$(vm_qmp "$name")
+    [[ -S "$qmp_sock" ]] || die "QMP socket not available. Is the VM running?"
+
+    log "Capturing guest memory via QMP (this takes 1-2 minutes)..."
+    local elf_dump="$outdir/guest-memory.elf"
+
+    _QMP_SOCK="$qmp_sock" _DUMP_PATH="$elf_dump" python3 << 'QMPEOF'
+import socket, json, time, os, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ['_QMP_SOCK'])
+s.settimeout(300)
+s.recv(4096)
+s.sendall(json.dumps({'execute': 'qmp_capabilities'}).encode() + b'\n')
+time.sleep(0.5); s.recv(4096)
+cmd = {'execute': 'dump-guest-memory', 'arguments': {'paging': False, 'protocol': 'file:' + os.environ['_DUMP_PATH']}}
+s.sendall(json.dumps(cmd).encode() + b'\n')
+buf = b''
+deadline = time.time() + 300
+while time.time() < deadline:
+    try:
+        buf += s.recv(4096)
+        for line in buf.split(b'\n'):
+            line = line.strip()
+            if not line: continue
+            try:
+                msg = json.loads(line)
+                if 'return' in msg: print('OK'); s.close(); sys.exit(0)
+                if 'error' in msg: print(f'ERROR: {msg["error"]}'); s.close(); sys.exit(1)
+            except json.JSONDecodeError: pass
+        buf = buf.split(b'\n')[-1]
+    except socket.timeout: break
+print('TIMEOUT'); s.close(); sys.exit(1)
+QMPEOF
+
+    if [[ -f "$elf_dump" ]]; then
+        ok "Memory dump: $elf_dump ($(du -h "$elf_dump" | cut -f1))"
+        _analyze_elf_dump "$elf_dump" "$outdir"
+    else
+        die "QMP memory dump failed"
+    fi
+}
+
+_analyze_dump() {
+    local dumpfile="$1" outdir="$2"
+    log "Analyzing: $dumpfile"
+
+    log "Crash info..."
+    vol -f "$dumpfile" windows.crashinfo.Crashinfo > "$outdir/crashinfo.txt" 2>/dev/null || true
+    [[ -s "$outdir/crashinfo.txt" ]] && { ok "Crash info:"; cat "$outdir/crashinfo.txt"; echo ""; }
+
+    log "Kernel modules (srvnet, ntoskrnl)..."
+    vol -f "$dumpfile" windows.modules.Modules 2>/dev/null | grep -iE "srvnet|srv2|ntoskrnl|tcpip" > "$outdir/modules.txt" || true
+    [[ -s "$outdir/modules.txt" ]] && cat "$outdir/modules.txt"
+
+    log "Pool scan (Smb/Srv tags)..."
+    vol -f "$dumpfile" windows.poolscanner.PoolScanner 2>/dev/null | head -50 > "$outdir/pool_scan.txt" || true
+
+    log "System threads at crash..."
+    vol -f "$dumpfile" windows.threads.Threads --pid 4 2>/dev/null | head -30 > "$outdir/system_threads.txt" || true
+
+    echo ""
+    echo "Analysis files in: $outdir/"
+    echo "  crashinfo.txt      — bugcheck code, parameters, faulting address"
+    echo "  modules.txt        — kernel module base addresses"
+    echo "  pool_scan.txt      — pool allocations"
+    echo "  system_threads.txt — system thread stacks"
+    echo ""
+    echo "Manual: vol -f $dumpfile windows.crashinfo.Crashinfo"
+}
+
+_analyze_elf_dump() {
+    local elf="$1" outdir="$2"
+    log "Analyzing ELF memory dump..."
+    vol --single-location "file://$elf" windows.crashinfo.Crashinfo > "$outdir/crashinfo.txt" 2>/dev/null || true
+    vol --single-location "file://$elf" windows.modules.Modules 2>/dev/null | grep -iE "srvnet|srv2|ntoskrnl" > "$outdir/modules.txt" || true
+    vol --single-location "file://$elf" windows.pslist.PsList > "$outdir/pslist.txt" 2>/dev/null || true
+    vol --single-location "file://$elf" windows.netscan.NetScan > "$outdir/netscan.txt" 2>/dev/null || true
+
+    [[ -s "$outdir/crashinfo.txt" ]] && { ok "Crash info:"; cat "$outdir/crashinfo.txt"; }
+    [[ -s "$outdir/modules.txt" ]] && { echo ""; echo "Relevant modules:"; cat "$outdir/modules.txt"; }
+}
+
+_analyze_minidump() {
+    local dmpfile="$1" outdir="$2"
+    log "Analyzing minidump: $(basename "$dmpfile")"
+    python3 -c "
+from minidump.minidumpfile import MinidumpFile
+mf = MinidumpFile.parse('$dmpfile')
+print(f'Exception: 0x{mf.exception.ExceptionRecord.ExceptionCode:08X}')
+print(f'Thread ID: {mf.exception.ThreadId}')
+print(f'Address:   0x{mf.exception.ExceptionRecord.ExceptionAddress:016X}')
+for mod in mf.modules.modules:
+    n = mod.name.lower()
+    if any(k in n for k in ['srvnet','srv2','ntoskrnl','tcpip']):
+        print(f'Module: {mod.name} @ 0x{mod.baseaddress:016X} size=0x{mod.size:X}')
+" > "$outdir/minidump_info.txt" 2>/dev/null || true
+    [[ -s "$outdir/minidump_info.txt" ]] && { ok "Minidump:"; cat "$outdir/minidump_info.txt"; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1479,6 +1728,7 @@ case "${1:-help}" in
     feature)      shift; cmd_feature "$@";;
     offsets)      shift; cmd_offsets "$@";;
     exploit-test) shift; cmd_exploit_test "$@";;
+    analyze)      shift; cmd_analyze "$@";;
     snapshot)     shift; cmd_snapshot "$@";;
     start)        shift; cmd_start "$@";;
     stop)         shift; cmd_stop "$@";;
@@ -1508,6 +1758,7 @@ COMMANDS:
   feature      Toggle Windows features (firewall, SMBv3, KD, ASLR, ...)
   offsets      Calculate exploit offsets from target binaries
   exploit-test Run PoC with monitoring (PCAP, crash dump, shell capture)
+  analyze      Pull + analyze crash dumps (MEMORY.DMP, minidumps, QMP live capture)
   snapshot     create|restore|list|delete QCOW2 snapshots
   start        Start VM [--debug gdb|serial|both] [--cpus N] [--ram M] [--qemu-extra '...']
   stop         Graceful shutdown (--force to kill)

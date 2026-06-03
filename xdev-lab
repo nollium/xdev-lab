@@ -105,7 +105,7 @@ conn.close()
 vm_exec() {
     local ip="$1"; shift
     local _out _rc=0
-    _out=$(wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1) || _rc=$?
+    _out=$(timeout 60 wmiexec.py -hashes "${LM}:${NT}" "Administrator@${ip}" "$*" 2>&1) || _rc=$?
     printf '%s\n' "$_out" | grep -v "^Impacket\|^\[\*\] SMB"
     return $_rc
 }

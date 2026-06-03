@@ -41,30 +41,31 @@ die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
 # ── vm database (json, via python oneliners) ─────────────────────────────
 
 _db_get() {
-    python3 -c "
-import json,os,sys
-db=json.load(open('$DB')) if os.path.exists('$DB') else {}
-v=db.get('$1',{}).get('$2','')
+    _DB_PATH="$DB" _DB_KEY="$1" _DB_FIELD="$2" python3 -c "
+import json,os
+p=os.environ['_DB_PATH']
+db=json.load(open(p)) if os.path.exists(p) else {}
+v=db.get(os.environ['_DB_KEY'],{}).get(os.environ['_DB_FIELD'],'')
 if v: print(v)
 " 2>/dev/null
 }
 
 _db_set() {
-    python3 -c "
+    _DB_PATH="$DB" _DB_KEY="$1" _DB_FIELD="$2" _DB_VAL="$3" python3 -c "
 import json,os
-p='$DB'
+p=os.environ['_DB_PATH']
 db=json.load(open(p)) if os.path.exists(p) else {}
-db.setdefault('$1',{})['$2']='$3'
+db.setdefault(os.environ['_DB_KEY'],{})[os.environ['_DB_FIELD']]=os.environ['_DB_VAL']
 json.dump(db,open(p,'w'),indent=2)
 " 2>/dev/null
 }
 
 _db_del() {
-    python3 -c "
+    _DB_PATH="$DB" _DB_KEY="$1" python3 -c "
 import json,os
-p='$DB'
+p=os.environ['_DB_PATH']
 db=json.load(open(p)) if os.path.exists(p) else {}
-db.pop('$1',None)
+db.pop(os.environ['_DB_KEY'],None)
 json.dump(db,open(p,'w'),indent=2)
 " 2>/dev/null
 }
@@ -89,13 +90,14 @@ require_vm() {
 # ── smb helpers via impacket ─────────────────────────────────────────────
 
 _smb() {
-    # $1=ip $2=python-body  (conn object available, authenticated)
-    python3 -c "
+    local ip="$1"; shift
+    _SMB_IP="$ip" _SMB_LM="$LM" _SMB_NT="$NT" python3 -c "
 from impacket.smbconnection import SMBConnection
-import sys
-conn=SMBConnection('$1','$1')
-conn.login('Administrator','','',lmhash='$LM',nthash='$NT')
-$2
+import os
+ip=os.environ['_SMB_IP']
+conn=SMBConnection(ip,ip)
+conn.login('Administrator','','',lmhash=os.environ['_SMB_LM'],nthash=os.environ['_SMB_NT'])
+$*
 conn.close()
 " 2>/dev/null
 }
@@ -108,18 +110,20 @@ vm_exec() {
 
 vm_upload() {
     local ip="$1" src="$2" dst="$3"
-    _smb "$ip" "
-with open('$src','rb') as f:
-    conn.putFile('C\$','$dst',f.read)
+    _SMB_SRC="$src" _SMB_DST="$dst" _smb "$ip" "
+import os
+with open(os.environ['_SMB_SRC'],'rb') as f:
+    conn.putFile('C\$',os.environ['_SMB_DST'],f.read)
 print('ok')
 "
 }
 
 vm_download() {
     local ip="$1" remote="$2" local_path="$3"
-    _smb "$ip" "
-with open('$local_path','wb') as f:
-    conn.getFile('C\$','$remote',f.write)
+    _SMB_REMOTE="$remote" _SMB_LOCAL="$local_path" _smb "$ip" "
+import os
+with open(os.environ['_SMB_LOCAL'],'wb') as f:
+    conn.getFile('C\$',os.environ['_SMB_REMOTE'],f.write)
 print('ok')
 "
 }
@@ -129,10 +133,10 @@ print('ok')
 qmp() {
     local sock="$(vm_qmp "$1")"
     [ -S "$sock" ] || return 1
-    python3 -c "
-import socket,json,time,sys
+    _QMP_SOCK="$sock" python3 -c "
+import socket,json,time,os
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-s.connect('$sock')
+s.connect(os.environ['_QMP_SOCK'])
 s.settimeout(10)
 s.recv(4096)
 s.sendall(json.dumps({'execute':'qmp_capabilities'}).encode()+b'\n')
@@ -571,13 +575,16 @@ AUEOF
         -qmp "unix:${qmp_sock},server,nowait" \
         -daemonize 2>&1) || true
 
-    # Verify QEMU actually started
-    sleep 1
-    if ! vm_running "$name"; then
-        err "QEMU failed to start:"
-        echo "$qemu_out" >&2
-        die "Check: is the ISO path correct? Is KVM available? Is the TAP free?"
-    fi
+    # Verify QEMU actually started (retry a few times for slow systems)
+    local _qstart=0
+    while ! vm_running "$name"; do
+        sleep 1; _qstart=$((_qstart+1))
+        if (( _qstart >= 5 )); then
+            warn "QEMU failed to start:"
+            echo "$qemu_out" >&2
+            die "Check: is the ISO path correct? Is KVM available? Is the TAP free?"
+        fi
+    done
 
     _db_set "$name" ip "$ip"
     _db_set "$name" build "${build:-unknown}"
@@ -793,7 +800,7 @@ cmd_update() {
         if [[ -f "$msu" ]]; then
             local fname=$(basename "$msu")
             log "Serving $fname to VM via HTTP..."
-            cd "$(dirname "$msu")" && python3 -m http.server 8888 --bind "$HOST_IP" &>/dev/null &
+            ( cd "$(dirname "$msu")" && python3 -m http.server 8888 --bind "$HOST_IP" ) &>/dev/null &
             local http_pid=$!
             sleep 1
             vm_exec "$ip" "powershell -Command \"Invoke-WebRequest -Uri http://${HOST_IP}:8888/$fname -OutFile C:\\Windows\\Temp\\$fname -UseBasicParsing\"" 2>/dev/null
@@ -855,6 +862,7 @@ cmd_snapshot() {
             qemu-img snapshot -l "$d" 2>/dev/null || echo "No snapshots";;
         delete)
             [[ -z "$snap" ]] && die "Snapshot name required"
+            vm_running "$name" && die "Stop VM first"
             qemu-img snapshot -d "$snap" "$d"; ok "Deleted '$snap'";;
     esac
 }
@@ -883,6 +891,7 @@ cmd_start() {
 
     net_ensure
     local ip=$(vm_ip "$name") tap="tap-${name}"
+    [[ -z "$ip" ]] && die "VM '$name' not in database. Run: xdev-lab list"
     local last=${ip##*.}
     local vnc=$((last - 8)); (( vnc < 1 )) && vnc=2
     local qmp_sock=$(vm_qmp "$name")
@@ -896,7 +905,8 @@ cmd_start() {
         both)   debug_flags="-s -serial tcp::$((4440+last)),server,nowait";;
     esac
 
-    qemu-system-x86_64 \
+    local qemu_start_out
+    qemu_start_out=$(qemu-system-x86_64 \
         -name "$name" -machine pc,accel=kvm -cpu host -smp "$smp" -m 4096 \
         -hda "$d" -boot c \
         -device e1000e,netdev=n0,mac="52:54:00:dc:00:$(printf '%02x' "$last")" \
@@ -905,17 +915,27 @@ cmd_start() {
         -usb -device usb-tablet \
         -qmp "unix:${qmp_sock},server,nowait" \
         $debug_flags $extra \
-        -daemonize 2>&1
+        -daemonize 2>&1) || true
+
+    local _qstart=0
+    while ! vm_running "$name"; do
+        sleep 1; _qstart=$((_qstart+1))
+        if (( _qstart >= 5 )); then
+            warn "QEMU failed to start:"
+            echo "$qemu_start_out" >&2
+            die "Check VNC/QMP ports, KVM availability, and disk path"
+        fi
+    done
 
     _db_set "$name" status running
     ok "'$name' started (VNC: 127.0.0.1:$((5900+vnc)))"
-    [[ -n "$debug" ]] && {
+    if [[ -n "$debug" ]]; then
         case "$debug" in
             gdb)    ok "GDB stub: localhost:1234 — connect with: gdb -ex 'target remote :1234'";;
             serial) ok "KD serial: localhost:$((4440+last)) — connect WinDbg: -k com:port=//./pipe/com_$((4440+last)),baud=115200";;
             both)   ok "GDB: :1234  KD serial: :$((4440+last))";;
         esac
-    }
+    fi
 }
 
 cmd_stop() {
